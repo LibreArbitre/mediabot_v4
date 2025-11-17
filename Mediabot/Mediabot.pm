@@ -136,37 +136,25 @@ sub get_user_from_message {
 }
 
 
-# Log info with timestamp
-sub my_log_info {
-    my ($self, $msg) = @_;
-    my $ts = POSIX::strftime("[%d/%m/%Y %H:%M:%S]", localtime);
-    print STDOUT "$ts [INFO] $msg\n";
-}
-
-# Log error with timestamp
-sub my_log_error {
-    my ($self, $msg) = @_;
-    my $ts = POSIX::strftime("[%d/%m/%Y %H:%M:%S]", localtime);
-    print STDERR "$ts [ERROR] $msg\n";
-}
-
 # Read the configuration file and populate the $self->{conf} object
 sub readConfigFile {
     my ($self, $file) = @_;
+
+    my $logger = $self->{logger};
 
     $file //= $self->{config_file}
         or croak "No config file specified (\$self->{config_file} is empty)";
 
     unless (-e $file) {
-        $self->my_log_error("Config file '$file' does not exist");
+        $logger->error("Config file '$file' does not exist");
         return;
     }
     unless (-r $file) {
-        $self->my_log_error("Cannot read config file '$file'");
+        $logger->error("Cannot read config file '$file'");
         return;
     }
 
-    $self->my_log_info("Loading configuration from '$file'");
+    $logger->info("Loading configuration from '$file'");
 
     my $conf;
     eval {
@@ -174,13 +162,13 @@ sub readConfigFile {
         $conf = Mediabot::Conf->new(undef, $file);
     };
     if ($@ or not $conf) {
-        $self->my_log_error("Failed to load configuration: $@");
+        $logger->error("Failed to load configuration: $@");
         return;
     }
 
     $self->{conf} = $conf;
 
-    $self->my_log_info("Configuration loaded successfully");
+    $logger->info("Configuration loaded successfully");
     return 1;
 }
 
@@ -356,27 +344,34 @@ sub getPidFromFile(@) {
 sub init_log {
     my ($self) = @_;
 
-    my $log_path = $self->{conf}->get('main.MAIN_LOG_FILE');
+    my $conf = $self->{conf} // croak 'Configuration must be loaded before init_log';
+    my $log_path = $conf->get('main.MAIN_LOG_FILE');
     unless (defined $log_path && $log_path ne '') {
-        print STDERR "[ERROR] Log file path not defined in config.\n";
-        clean_and_exit($self, 1);
+        $self->{logger}->error('Log file path not defined in config.');
+        $self->clean_and_exit(1);
     }
 
-    open(my $LOG, ">>", $log_path) or do {
-        print STDERR "[ERROR] Could not open log file '$log_path' for writing: $!\n";
-        clean_and_exit($self, 1);
+    my $debug_level = int($conf->get('main.MAIN_PROG_DEBUG') // 0);
+    my $logger = eval {
+        Mediabot::Log->new(
+            debug_level => $debug_level,
+            logfile     => $log_path,
+        );
     };
 
-    # Autoflush enabled
-    select((select($LOG), $| = 1)[0]);
+    if (!$logger) {
+        my $error = $@ // 'Unknown error';
+        $self->{logger}->error("Could not initialize log file '$log_path': $error");
+        $self->clean_and_exit(1);
+    }
 
-    # Optional: timestamp or header
-    print $LOG "+--------------------------------------------------------------------------------+\n";
-    print $LOG "| Mediabot log started at " . scalar(localtime) . "\n";
-    print $LOG "+--------------------------------------------------------------------------------+\n";
+    $self->{logger} = $logger;
 
-    # Store filehandle in object
-    $self->{LOG} = $LOG;
+    $logger->info("+--------------------------------------------------------------------------------+");
+    $logger->info("| Mediabot log started at " . scalar(localtime) . " |");
+    $logger->info("+--------------------------------------------------------------------------------+");
+
+    return $logger;
 }
 
 
@@ -491,18 +486,6 @@ sub clean_and_exit(@) {
         1;
     };
 
-    # --- Raw LOG filehandle: safe close ---
-    eval {
-        if (defined $self->{LOG}) {
-            my $fh = $self->{LOG};
-            if (defined(fileno($fh))) {
-                eval { local $| = 1; 1; }; # opportunistic flush
-                close $fh;
-            }
-        }
-        1;
-    };
-
     # --- Flush object logger if available ---
     eval {
         $self->{logger}->flush()
@@ -518,7 +501,6 @@ sub clean_and_exit(@) {
 sub dbConnect(@) {
     my ($self) = @_;
     my $conf = $self->{conf};
-    my $LOG  = $self->{LOG};
 
     my $dbname = $conf->get('mysql.MAIN_PROG_DDBNAME');
     my $dbhost = $conf->get('mysql.MAIN_PROG_DBHOST') // 'localhost';
@@ -564,7 +546,6 @@ sub getDbh(@) {
 # Check if the USER table exists in the database
 sub dbCheckTables(@) {
     my ($self) = shift;
-    my $LOG = $self->{LOG};
     my $dbh = $self->{dbh};
 
     $self->{logger}->log(3, "Checking USER table");
@@ -593,9 +574,8 @@ sub dbCheckTables(@) {
 
 # Logout all users in the USER table
 sub dbLogoutUsers(@) {
-	my ($self) = shift;
-	my $LOG = $self->{LOG};
-	my $dbh = $self->{dbh};
+        my ($self) = shift;
+        my $dbh = $self->{dbh};
 	my $sLogoutQuery = "UPDATE USER SET auth=0 WHERE auth=1";
 	my $sth = $dbh->prepare($sLogoutQuery);
 	unless ($sth->execute) {
