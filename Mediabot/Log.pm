@@ -3,14 +3,17 @@ use strict;
 use warnings;
 use POSIX qw(strftime);
 
+use constant DEFAULT_DEBUG_LEVEL => 0;
+
 sub new {
     my ($class, %args) = @_;
     my $self = bless {}, $class;
 
-    $self->{debug_level} = int($args{debug_level} // 0);  # valeur par défaut : 0
+    $self->{debug_level} = int($args{debug_level} // DEFAULT_DEBUG_LEVEL);
 
     if (defined $args{logfile}) {
-        open my $fh, '>>:utf8', $args{logfile} or die "Cannot open logfile $args{logfile}: $!";
+        open my $fh, '>>:utf8', $args{logfile}
+            or die "Cannot open logfile $args{logfile}: $!";
         $fh->autoflush(1);
         $self->{logfilehandle} = $fh;
     }
@@ -22,7 +25,9 @@ sub log {
     my ($self, $level, $msg) = @_;
     return unless defined $msg && $msg ne '';
 
-    my $debug_level = $self->{debug_level} // 0;
+    $level = int($level // DEFAULT_DEBUG_LEVEL);
+
+    my $debug_level = $self->{debug_level} // DEFAULT_DEBUG_LEVEL;
     return if $level > $debug_level;
 
     my $timestamp = strftime("[%d/%m/%Y %H:%M:%S]", localtime);
@@ -65,6 +70,37 @@ sub log {
     # Write to logfile if enabled
     if (my $fh = $self->{logfilehandle}) {
         print $fh $logline;
+    }
+}
+
+sub info {
+    my ($self, $msg) = @_;
+    $self->log(0, $msg);
+}
+
+sub warn {
+    my ($self, $msg) = @_;
+    $self->log(0, "[WARN] $msg");
+}
+
+sub error {
+    my ($self, $msg) = @_;
+    $self->log(0, "[ERROR] $msg");
+}
+
+sub debug {
+    my ($self, $level, $msg) = @_;
+    $level = 1 unless defined $level;
+    $self->log($level, $msg);
+}
+
+sub flush {
+    my ($self) = @_;
+
+    if (my $fh = $self->{logfilehandle}) {
+        my $old = select($fh);
+        $| = 1;
+        select($old);
     }
 }
 

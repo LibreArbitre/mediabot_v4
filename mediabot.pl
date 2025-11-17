@@ -47,14 +47,14 @@ my $MAIN_PROG_DAEMON = 0;
 my $BOTNICK_WASNOT_TRIGGERED = 0;
 my $BOTNICK_WAS_TRIGGERED = 1;
 
+my $bootstrap_logger = Mediabot::Log->new(debug_level => 0);
+my $logger = $bootstrap_logger;
+my $mediabot;
+
 # +---------------------------------------------------------------------------+
 # !          SUBS DECLARATION                                                 !
 # +---------------------------------------------------------------------------+
 sub usage;
-sub log_message;
-sub log_info;
-sub log_warn;
-sub log_error;
 sub catch_hup;
 sub catch_term;
 sub catch_int;
@@ -137,25 +137,19 @@ unless (defined($CONFIG_FILE)) {
 }
 
 # Create Mediabot instance
-my $mediabot = Mediabot->new({
+$mediabot = Mediabot->new({
     config_file => $CONFIG_FILE,
     server      => $sServer,
 });
 
 # Load configuration before anything else
 unless ($mediabot->readConfigFile()) {
-    print "[FATAL] Could not load configuration, aborting.\n";
+    $logger->error('[FATAL] Could not load configuration, aborting.');
     exit 1;
 }
 
 # Now that we have the config, we can initialize the logger
-$mediabot->init_log();
-
-# Logger initialization
-$mediabot->{logger} = Mediabot::Log->new(
-    debug_level => $mediabot->{conf}->get('main.MAIN_PROG_DEBUG'),
-    logfile     => $mediabot->{conf}->get('main.MAIN_LOG_FILE'),
-);
+$logger = $mediabot->init_log();
 
 # Trap signals
 init_signals($mediabot->{logger});
@@ -198,8 +192,8 @@ if (defined $pid && $pid =~ /^\d+$/) {
 
 
 
-log_info("mediabot_v3 Copyright (C) 2019-2025 teuk");
-log_info("Mediabot v$MAIN_PROG_VERSION starting with config file $CONFIG_FILE");
+$logger->info("mediabot_v3 Copyright (C) 2019-2025 teuk");
+$logger->info("Mediabot v$MAIN_PROG_VERSION starting with config file $CONFIG_FILE");
 
 # Daemon mode actions
 if ($MAIN_PROG_DAEMON) {
@@ -399,10 +393,11 @@ $loop->run;
 # Display usage information
 sub usage {
     my ($strErr) = @_;
+    my $active_logger = ($mediabot && $mediabot->{logger}) ? $mediabot->{logger} : $logger;
     if (defined($strErr)) {
-        log_error("Error : " . $strErr);
+        $active_logger->error("Error : " . $strErr);
     }
-    log_error("Usage: " . basename($0) . "--conf=<config_file> [--check] [--daemon] [--server=<hostname>]");
+    $active_logger->error("Usage: " . basename($0) . "--conf=<config_file> [--check] [--daemon] [--server=<hostname>]");
     exit 4;
 }
 
@@ -426,47 +421,14 @@ sub set_utf8_output {
     binmode STDERR, ':utf8';
 }
 
-# Get timestamp for logging
-sub log_timestamp {
-    return strftime("[%d/%m/%Y %H:%M:%S]", localtime);
-}
-
-# Log a message with a specific level
-sub log_message {
-    my ($level, $msg) = @_;
-    $level //= 0;
-    
-    if ($mediabot) {
-        $mediabot->{logger}->log($level,$msg);
-    } else {
-        my $ts = POSIX::strftime("[%d/%m/%Y %H:%M:%S]", localtime);
-        print "$ts $msg\n" if $level <= 0;
-    }
-}
-
 sub log_debug_args {
     my ($context, $message) = @_;
     return unless defined $message && ref($message) && $mediabot;
-    
+
     my $dump = Dumper($message->args);
     $dump =~ s/^\$VAR1 = //;
     $dump =~ s/;\s*$//;
     $mediabot->{logger}->log(5, "$context args: $dump");
-}
-
-sub log_info {
-    my ($msg) = @_;
-    print STDOUT log_timestamp() . " [INFO] $msg\n";
-}
-
-sub log_warn {
-    my ($msg) = @_;
-    print STDERR log_timestamp() . " [WARN] $msg\n";
-}
-
-sub log_error {
-    my ($msg) = @_;
-    print STDERR log_timestamp() . " [ERROR] $msg\n";
 }
 
 sub on_timer_tick {
@@ -478,7 +440,7 @@ sub on_timer_tick {
     # Update pid file
     my $sPidFilename = $mediabot->{conf}->get('main.MAIN_PID_FILE');
     unless (open PID, ">$sPidFilename") {
-        log_error("Could not open $sPidFilename for writing.");
+        $mediabot->{logger}->error("Could not open $sPidFilename for writing.");
     }
     else {
         print PID "$$";
@@ -1540,14 +1502,14 @@ sub catch_hup {
 
 sub catch_term {
     my ($signal) = @_;    # you can inspect $signal if you like
-    log_message(0,"Received SIGTERM (Ctrl+C). Initiating clean shutdown.");
+    $logger->info('Received SIGTERM (Ctrl+C). Initiating clean shutdown.');
     $mediabot && $mediabot->clean_and_exit(0);
     exit 0;
 }
 
 sub catch_int {
     my ($signal) = @_;    # you can inspect $signal if you like
-    log_message(0,"Received SIGINT (Ctrl+C). Initiating clean shutdown.");
+    $logger->info('Received SIGINT (Ctrl+C). Initiating clean shutdown.');
     $mediabot && $mediabot->clean_and_exit(0);
     exit 0;
 }
