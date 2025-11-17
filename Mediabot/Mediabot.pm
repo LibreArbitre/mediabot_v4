@@ -89,6 +89,8 @@ sub get_user_from_message {
 
     my $cache   = $self->_ensure_hostmask_cache;
     my $entries = $cache ? $cache->{entries} : [];
+    my $levels_by_id = ($cache && $cache->{levels_by_id})
+        || (($self->_ensure_levels_cache || {})->{levels_by_id} || {});
     unless ($entries && @{$entries}) {
         $self->{logger}->log(3, "🚫 hostmask cache empty, no user can be matched");
         return;
@@ -106,11 +108,12 @@ sub get_user_from_message {
         }
 
         my %row = %{ $user_row };
+        _populate_user_level_fields(\%row, $levels_by_id);
         $row{dbh} = $self->{dbh};
 
         require Mediabot::User;
         my $user = Mediabot::User->new(\%row);
-        $user->load_level($levels_by_id || $self->{dbh});
+        $user->load_level($levels_by_id);
 
         # DEBUG avant autologin
         $self->_dbg_auth_snapshot('pre-auto', $user, $nick, $fullmask);
@@ -231,6 +234,7 @@ sub _build_hostmask_cache {
             my $id_user = $row->{id_user};
             next unless defined $id_user;
             $users_by_id->{$id_user} ||= { %{$row} };
+            _populate_user_level_fields($users_by_id->{$id_user}, $levels_by_id);
             push @entries, {
                 mask        => $mask,
                 regex       => $regex,
@@ -256,6 +260,7 @@ sub _build_hostmask_cache {
                 my $id_user = $row->{id_user};
                 next unless defined $id_user;
                 $users_by_id->{$id_user} ||= { %{$row} };
+                _populate_user_level_fields($users_by_id->{$id_user}, $levels_by_id);
                 foreach my $mask (@masks) {
                     my $regex = _compile_hostmask_regex($mask);
                     next unless $regex;
@@ -284,6 +289,7 @@ sub _build_hostmask_cache {
         entries     => \@entries,
         users_by_id => $users_by_id,
         source      => $source,
+        levels_by_id => $levels_by_id,
         built_at    => time,
     };
 }
