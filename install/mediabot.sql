@@ -233,6 +233,25 @@ CREATE TABLE `USER` (
 -- --------------------------------------------------------
 
 --
+-- Structure de la table `USER_HOSTMASK`
+--
+
+CREATE TABLE `USER_HOSTMASK` (
+  `id_user_hostmask` bigint(20) NOT NULL AUTO_INCREMENT,
+  `id_user` bigint(20) NOT NULL,
+  `mask` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+  `mask_sql` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+  `mask_lc` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id_user_hostmask`),
+  KEY `idx_user_hostmask_id_user` (`id_user`),
+  KEY `idx_user_hostmask_mask_lc` (`mask_lc`(191)),
+  KEY `idx_user_hostmask_mask_sql` (`mask_sql`(191))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Structure de la table `USER_CHANNEL`
 --
 

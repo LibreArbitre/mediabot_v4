@@ -4,6 +4,8 @@ use strict;
 use warnings;
 use Carp;
 
+my @HOSTMASK_CHANGE_HOOKS;
+
 =head1 NAME
 
 Mediabot::User - Represents a user in the Mediabot system.
@@ -231,7 +233,7 @@ Returns: Mediabot::User object on success, undef on failure.
 =cut
 
 sub create {
-    my ($class, $dbh, $params, $logger) = @_;
+    my ($class, $dbh, $params, $logger, $opts) = @_;
 
     croak "create() requires DB handle" unless $dbh;
     croak "create() requires a hashref of params" unless ref($params) eq 'HASH';
@@ -302,12 +304,95 @@ sub create {
     return undef unless $row;
     $row->{dbh} = $dbh;
 
+    eval {
+        $class->sync_hostmask_index($dbh, $row->{id_user}, $hostmasks, $opts);
+        1;
+    } or do {
+        $logger->log(1, "⚠️ Unable to sync USER_HOSTMASK for $nickname: $@") if $logger;
+    };
+
     my $user_obj = $class->new($row);
     $user_obj->load_level($dbh);
 
     $logger->log(0, "✅ User created: $nickname (id_user=" . $user_obj->id . ", level=" . $user_obj->level_description . ")") if $logger;
 
     return $user_obj;
+}
+
+sub register_hostmask_change_hook {
+    my ($class, $cb) = @_;
+    return unless $cb && ref($cb) eq 'CODE';
+    push @HOSTMASK_CHANGE_HOOKS, $cb;
+}
+
+sub split_hostmasks {
+    my ($class, $raw) = @_;
+    return () unless defined $raw && length $raw;
+    my @parts = split /,/, $raw;
+    my @clean = grep { length } map { _normalize_hostmask($_) } @parts;
+    return @clean;
+}
+
+sub sync_hostmask_index {
+    my ($class, $dbh, $id_user, $hostmasks, $opts) = @_;
+    return 0 unless $dbh && $id_user;
+
+    my @masks = $class->split_hostmasks($hostmasks // '');
+    my $inserted = 0;
+
+    my $ok = eval {
+        my $sth_delete = $dbh->prepare('DELETE FROM USER_HOSTMASK WHERE id_user=?');
+        $sth_delete->execute($id_user);
+        $sth_delete->finish;
+
+        if (@masks) {
+            my $sth_insert = $dbh->prepare('INSERT INTO USER_HOSTMASK (id_user, mask, mask_sql, mask_lc) VALUES (?, ?, ?, ?)');
+            foreach my $mask (@masks) {
+                $sth_insert->execute($id_user, $mask, _mask_to_sql_pattern($mask), lc $mask);
+                $inserted++;
+            }
+            $sth_insert->finish;
+        }
+        1;
+    };
+
+    unless ($ok) {
+        carp "sync_hostmask_index() failed for id_user=$id_user: $@" if $@;
+        return 0;
+    }
+
+    $class->_notify_hostmask_change({
+        id_user    => $id_user,
+        mask_count => scalar @masks,
+        bot        => $opts ? $opts->{bot} : undef,
+    });
+
+    return $inserted;
+}
+
+sub _normalize_hostmask {
+    my ($mask) = @_;
+    return '' unless defined $mask;
+    $mask =~ s/^\s+|\s+$//g;
+    return $mask;
+}
+
+sub _mask_to_sql_pattern {
+    my ($mask) = @_;
+    return '' unless defined $mask;
+    my $pattern = lc $mask;
+    $pattern =~ s/%/\%/g;
+    $pattern =~ s/_/\_/g;
+    $pattern =~ s/\*/%/g;
+    $pattern =~ s/\?/_/g;
+    return $pattern;
+}
+
+sub _notify_hostmask_change {
+    my ($class, $payload) = @_;
+    foreach my $cb (@HOSTMASK_CHANGE_HOOKS) {
+        eval { $cb->($payload); 1 } or carp "hostmask change hook failed: $@";
+    }
 }
 
 
