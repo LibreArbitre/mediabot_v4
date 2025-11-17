@@ -36,6 +36,18 @@ use URI::Escape qw(uri_escape);
 use List::Util qw/min/;
 use File::Temp qw/tempfile/;
 use Carp qw(croak);
+
+Mediabot::User->register_hostmask_change_hook(sub {
+    my ($event) = @_;
+    my $bot = $event->{bot};
+    return unless $bot && ref $bot;
+    return unless $bot->can('invalidate_hostmask_cache');
+    $bot->invalidate_hostmask_cache;
+    if (my $logger = $bot->{logger}) {
+        my $uid = $event->{id_user} // '?';
+        $logger->log(4, "[hostmask-cache] invalidated after change on user $uid");
+    }
+});
 use Encode qw(encode);
 
 # --- Top of Mediabot.pm (near other 'my' / 'our' declarations)
@@ -75,54 +87,48 @@ sub get_user_from_message {
 
     $self->{logger}->log(3, "🔍 get_user_from_message() called with hostmask: '$fullmask'");
 
-    my $sth = $self->{dbh}->prepare("SELECT * FROM USER");
-    unless ($sth->execute) {
-        $self->{logger}->log(1, "❌ get_user_from_message() SQL Error: $DBI::errstr");
+    my $cache = $self->_ensure_hostmask_cache;
+    my $entries = $cache ? $cache->{entries} : [];
+    unless ($entries && @{$entries}) {
+        $self->{logger}->log(3, "🚫 hostmask cache empty, no user can be matched");
         return;
     }
 
     my $matched_user;
-    while (my $row = $sth->fetchrow_hashref) {
-        my @patterns = split(/,/, ($row->{hostmasks} // ''));
-        foreach my $mask (@patterns) {
-            my $orig_mask = $mask;
-            $mask =~ s/^\s+|\s+$//g;
-            my $regex = $mask; $regex =~ s/\./\\./g; $regex =~ s/\*/.*/g; $regex =~ s/\[/\\[/g; $regex =~ s/\]/\\]/g; $regex =~ s/\{/\\{/g; $regex =~ s/\}/\\}/g;
+    ENTRY: foreach my $entry (@{$entries}) {
+        next unless $fullmask =~ $entry->{regex};
 
-            if ($fullmask =~ /^$regex/) {
-                require Mediabot::User;
-                my $user = Mediabot::User->new($row);
-                $user->load_level($self->{dbh});
+        my %row = %{ $entry->{user_row} };
+        $row{dbh} = $self->{dbh};
 
-                # DEBUG avant autologin
-                $self->_dbg_auth_snapshot('pre-auto', $user, $nick, $fullmask);
+        require Mediabot::User;
+        my $user = Mediabot::User->new(\%row);
+        $user->load_level($self->{dbh});
 
-                # AUTOLOGIN (pose auth en DB)
-                if ($user->can('maybe_autologin')) {
-                    $user->maybe_autologin($self, $nick, $fullmask);
-                }
+        # DEBUG avant autologin
+        $self->_dbg_auth_snapshot('pre-auto', $user, $nick, $fullmask);
 
-                # DEBUG après autologin
-                $self->_dbg_auth_snapshot('post-auto', $user, $nick, $fullmask);
-
-                # Synchronise tous les caches si la DB dit auth=1
-                $self->_ensure_logged_in_state($user, $nick, $fullmask);
-
-                # DEBUG après synchronisation
-                $self->_dbg_auth_snapshot('post-ensure', $user, $nick, $fullmask);
-
-                $self->{logger}->log(3, "🎯 Matched user id=" . ($user->can('id') ? $user->id : $user->{id_user}) .
-                                         ", nickname='" . $user->nickname .
-                                         "', level='" . ($user->level_description // 'undef') . "'");
-
-                $matched_user = $user;
-                last;
-            }
+        # AUTOLOGIN (pose auth en DB)
+        if ($user->can('maybe_autologin')) {
+            $user->maybe_autologin($self, $nick, $fullmask);
         }
-        last if $matched_user;
-    }
 
-    $sth->finish;
+        # DEBUG après autologin
+        $self->_dbg_auth_snapshot('post-auto', $user, $nick, $fullmask);
+
+        # Synchronise tous les caches si la DB dit auth=1
+        $self->_ensure_logged_in_state($user, $nick, $fullmask);
+
+        # DEBUG après synchronisation
+        $self->_dbg_auth_snapshot('post-ensure', $user, $nick, $fullmask);
+
+        $self->{logger}->log(3, "🎯 Matched user id=" . ($user->can('id') ? $user->id : $user->{id_user}) .
+                                     ", nickname='" . $user->nickname .
+                                     "', level='" . ($user->level_description // 'undef') . "' via mask '$entry->{mask}'");
+
+        $matched_user = $user;
+        last ENTRY;
+    }
 
     unless ($matched_user) {
         $self->{logger}->log(3, "🚫 No user matched hostmask '$fullmask'");
@@ -133,6 +139,100 @@ sub get_user_from_message {
     $self->_dbg_auth_snapshot('return', $matched_user, $nick, $fullmask);
 
     return $matched_user;
+}
+
+sub invalidate_hostmask_cache {
+    my ($self) = @_;
+    delete $self->{_hostmask_cache};
+}
+
+sub _ensure_hostmask_cache {
+    my ($self) = @_;
+    $self->{_hostmask_cache} ||= $self->_build_hostmask_cache;
+    return $self->{_hostmask_cache};
+}
+
+sub _build_hostmask_cache {
+    my ($self) = @_;
+    my $dbh    = $self->{dbh};
+    my $logger = $self->{logger};
+    my @entries;
+    my $source = 'USER_HOSTMASK';
+
+    eval {
+        my $sql = q{
+            SELECT u.*, uh.mask AS hostmask_pattern
+            FROM USER_HOSTMASK uh
+            JOIN USER u ON u.id_user = uh.id_user
+            ORDER BY LENGTH(uh.mask) DESC, uh.id_user_hostmask ASC
+        };
+        my $sth = $dbh->prepare($sql);
+        $sth->execute;
+        while (my $row = $sth->fetchrow_hashref) {
+            my $mask = delete $row->{hostmask_pattern};
+            next unless defined $mask;
+            my $regex = _compile_hostmask_regex($mask);
+            next unless $regex;
+            my %user_row = %{$row};
+            push @entries, {
+                mask     => $mask,
+                regex    => $regex,
+                user_row => \%user_row,
+            };
+        }
+        $sth->finish;
+        1;
+    } or do {
+        $logger->log(1, "[hostmask-cache] USER_HOSTMASK lookup failed: $@") if $logger;
+        $source = 'USER';
+    };
+
+    if (!@entries) {
+        my $sth;
+        eval { $sth = $dbh->prepare('SELECT * FROM USER'); 1 } or do {
+            $logger->log(1, "[hostmask-cache] fallback prepare failed: $@") if $logger;
+        };
+        if ($sth && $sth->execute) {
+            while (my $row = $sth->fetchrow_hashref) {
+                my @masks = Mediabot::User->split_hostmasks($row->{hostmasks} // '');
+                foreach my $mask (@masks) {
+                    my $regex = _compile_hostmask_regex($mask);
+                    next unless $regex;
+                    my %user_row = %{$row};
+                    push @entries, {
+                        mask     => $mask,
+                        regex    => $regex,
+                        user_row => \%user_row,
+                    };
+                }
+            }
+        } elsif ($sth) {
+            $logger->log(1, "[hostmask-cache] fallback SELECT failed: $DBI::errstr") if $logger;
+        }
+        $sth->finish if $sth;
+        $source = 'USER';
+    }
+
+    if (@entries) {
+        $logger->log(4, sprintf('[hostmask-cache] built %d entries (source=%s)', scalar @entries, $source)) if $logger;
+    } else {
+        $logger->log(2, '[hostmask-cache] no hostmask entries available') if $logger;
+    }
+
+    return {
+        entries  => \@entries,
+        source   => $source,
+        built_at => time,
+    };
+}
+
+sub _compile_hostmask_regex {
+    my ($mask) = @_;
+    return unless defined $mask && length $mask;
+    my $regex = quotemeta($mask);
+    $regex =~ s/\\\*/.*/g;
+    $regex =~ s/\\\?/.?/g;
+    return qr/^$regex/;
 }
 
 
@@ -2111,6 +2211,14 @@ sub userAdd {
 
     my $id = $dbh->{mysql_insertid} || eval { $dbh->last_insert_id(undef, undef, 'USER', 'id_user') };
     $logger->log(0, "✅ userAdd() created user '$nickname' (id_user=$id, level_id=$level_id)");
+
+    eval {
+        Mediabot::User::sync_hostmask_index($dbh, $id, $hostmask, { bot => $self });
+        1;
+    } or do {
+        $logger->log(1, "userAdd() failed to sync USER_HOSTMASK: $@") if $logger;
+    };
+
     return $id;
 }
 
@@ -2892,17 +3000,25 @@ sub checkAuthByUser(@) {
 			}
 			else {
 				my $sNewHostmasks = "$sCurrentHostmasks,$sHostmask";
-				my $Query = "UPDATE USER SET hostmasks=? WHERE id_user=?";
-				my $sth = $self->{dbh}->prepare($Query);
-				unless ($sth->execute($sNewHostmasks,$id_user)) {
-					$self->{logger}->log(1,"checkAuthByUser() SQL Error : " . $DBI::errstr . " Query : " . $Query);
-					$sth->finish;
-					return (0,0);
-				}
-				$sth->finish;
-				return ($id_user,0);
-			}
-		}
+                                my $Query = "UPDATE USER SET hostmasks=? WHERE id_user=?";
+                                my $sth = $self->{dbh}->prepare($Query);
+                                unless ($sth->execute($sNewHostmasks,$id_user)) {
+                                        $self->{logger}->log(1,"checkAuthByUser() SQL Error : " . $DBI::errstr . " Query : " . $Query);
+                                        $sth->finish;
+                                        return (0,0);
+                                }
+                                $sth->finish;
+
+                                eval {
+                                    Mediabot::User::sync_hostmask_index($self->{dbh}, $id_user, $sNewHostmasks, { bot => $self });
+                                    1;
+                                } or do {
+                                    $self->{logger}->log(1, "checkAuthByUser() unable to sync USER_HOSTMASK: $@");
+                                };
+
+                                return ($id_user,0);
+                        }
+                }
 		else {
 			$sth->finish;
 			return (0,0);
@@ -3380,6 +3496,13 @@ sub addUserHost(@) {
                     $self->{logger}->log(0, $msg);
                     noticeConsoleChan($self, $msg);
                     logBot($self, $message, undef, "addhost", $msg);
+
+                    eval {
+                        Mediabot::User::sync_hostmask_index($self->{dbh}, $id_user, $sUpdatedHostmasks, { bot => $self });
+                        1;
+                    } or do {
+                        $self->{logger}->log(1, "addhost() unable to sync USER_HOSTMASK: $@");
+                    };
                 } else {
                     $self->{logger}->log(1, "addUserHost() SQL Error : $DBI::errstr | Query: $sQuery");
                 }
