@@ -718,6 +718,10 @@ sub on_message_KICK {
         }
         $mediabot->channelNicksRemove($target_name,$kicked_nick);
     }
+    $mediabot->invalidate_channel_user_cache(
+        name     => $target_name,
+        nickname => $kicked_nick,
+    );
     $mediabot->logBotAction($message,"kick",$kicker_nick,$target_name,"$kicked_nick ($text)");
 }
 
@@ -803,6 +807,10 @@ sub on_message_QUIT {
     }
     for my $sChannel (keys %hChannelsNicks) {
         $mediabot->channelNicksRemove($sChannel,$sNick);
+        $mediabot->invalidate_channel_user_cache(
+            name     => $sChannel,
+            nickname => $sNick,
+        );
     }
 }
 
@@ -828,6 +836,10 @@ sub on_message_PART {
         $mediabot->logBotAction($message,"part",$sNick,$target_name,"");
         $mediabot->channelNicksRemove($target_name,$sNick);
     }
+    $mediabot->invalidate_channel_user_cache(
+        name     => $target_name,
+        nickname => $sNick,
+    );
 }
 
 sub on_message_PRIVMSG {
@@ -1103,6 +1115,10 @@ sub on_message_JOIN {
         if (defined($mediabot->{conf}->get('main.MAIN_PROG_LIVE')) && ($mediabot->{conf}->get('main.MAIN_PROG_LIVE') == 1)) {
             $mediabot->{logger}->log(0,"[LIVE] <$target_name> * Joins $sNick ($sIdent\@$sHost)");
         }
+        $mediabot->invalidate_channel_user_cache(
+            name     => $target_name,
+            nickname => $sNick,
+        );
         $mediabot->userOnJoin($message,$target_name,$sNick);
         push @{$hChannelsNicks{$target_name}}, $sNick;
         $mediabot->sethChannelNicks(\%hChannelsNicks);

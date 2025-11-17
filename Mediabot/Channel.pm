@@ -3,6 +3,7 @@ package Mediabot::Channel;
 use strict;
 use warnings;
 use DBI;
+use constant USER_INFO_CACHE_TTL => 60;    # seconds
 
 sub new {
     my ($class, $args) = @_;
@@ -17,6 +18,9 @@ sub new {
         key       => $args->{key},
         dbh       => $args->{dbh},  # needed for SQL updates
         irc       => $args->{irc},  # needed for IRC operations
+        logger    => $args->{logger},
+        user_info_cache     => {},
+        user_info_cache_ttl => $args->{user_info_cache_ttl} // USER_INFO_CACHE_TTL,
     };
     bless $self, $class;
     return $self;
@@ -53,26 +57,8 @@ sub get_chanmode        { return shift->{chanmode}; }
 # Get user level in this channel
 sub get_user_level {
     my ($self, $nickname) = @_;
-    my $level = 0;
-
-    my $sth = $self->{dbh}->prepare(q{
-        SELECT level
-        FROM USER
-        JOIN USER_CHANNEL USING (id_user)
-        WHERE id_channel = ?
-          AND nickname = ?
-    });
-
-    if ($sth->execute($self->{id}, $nickname)) {
-        if (my $ref = $sth->fetchrow_hashref) {
-            $level = $ref->{level};
-        }
-    } else {
-        $self->{logger}->log(1, "get_user_level SQL error: $DBI::errstr");
-    }
-
-    $sth->finish;
-    return $level;
+    my $info = $self->get_user_info($nickname);
+    return $info->{level} // 0;
 }
 
 # Get user info (level, automode, greet) in this channel
@@ -83,6 +69,21 @@ sub get_user_info {
         automode => 'None',
         greet    => 'None',
     };
+
+    return $info unless defined $nickname && $nickname ne '';
+
+    my $cache   = $self->{user_info_cache} ||= {};
+    my $ttl     = defined $self->{user_info_cache_ttl} ? $self->{user_info_cache_ttl} : USER_INFO_CACHE_TTL;
+    my $now     = time;
+    my $cached  = $cache->{$nickname};
+
+    if ($cached && $now - ($cached->{timestamp} // 0) <= $ttl) {
+        return {
+            level    => $cached->{level},
+            automode => $cached->{automode},
+            greet    => $cached->{greet},
+        };
+    }
 
     my $sth = $self->{dbh}->prepare(q{
         SELECT level, automode, greet
@@ -99,11 +100,33 @@ sub get_user_info {
             $info->{greet}    = $ref->{greet}    if defined $ref->{greet};
         }
     } else {
-        $self->{logger}->log(1, "get_user_info SQL error: $DBI::errstr");
+        $self->{logger}->log(1, "get_user_info SQL error: $DBI::errstr") if $self->{logger};
     }
 
     $sth->finish;
+
+    $cache->{$nickname} = {
+        level     => $info->{level},
+        automode  => $info->{automode},
+        greet     => $info->{greet},
+        timestamp => $now,
+    };
+
     return $info;
+}
+
+sub invalidate_user_cache {
+    my ($self, $nickname) = @_;
+
+    unless (defined $self->{user_info_cache}) {
+        $self->{user_info_cache} = {};
+    }
+
+    if (defined $nickname && $nickname ne '') {
+        delete $self->{user_info_cache}{$nickname};
+    } else {
+        $self->{user_info_cache} = {};
+    }
 }
 
 
