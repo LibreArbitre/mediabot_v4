@@ -87,7 +87,7 @@ sub get_user_from_message {
 
     $self->{logger}->log(3, "🔍 get_user_from_message() called with hostmask: '$fullmask'");
 
-    my $cache = $self->_ensure_hostmask_cache;
+    my $cache   = $self->_ensure_hostmask_cache;
     my $entries = $cache ? $cache->{entries} : [];
     unless ($entries && @{$entries}) {
         $self->{logger}->log(3, "🚫 hostmask cache empty, no user can be matched");
@@ -98,7 +98,14 @@ sub get_user_from_message {
     ENTRY: foreach my $entry (@{$entries}) {
         next unless $fullmask =~ $entry->{regex};
 
-        my %row = %{ $entry->{user_row} };
+        my $users_by_id = $entry->{users_by_id} || $cache->{users_by_id} || {};
+        my $user_row = $users_by_id->{ $entry->{id_user} };
+        unless ($user_row) {
+            $self->{logger}->log(2, sprintf("[hostmask-cache] missing user row for id=%s", $entry->{id_user} // '?'));
+            next;
+        }
+
+        my %row = %{ $user_row };
         $row{dbh} = $self->{dbh};
 
         require Mediabot::User;
@@ -157,6 +164,7 @@ sub _build_hostmask_cache {
     my $dbh    = $self->{dbh};
     my $logger = $self->{logger};
     my @entries;
+    my $users_by_id = {};
     my $source = 'USER_HOSTMASK';
 
     eval {
@@ -173,11 +181,14 @@ sub _build_hostmask_cache {
             next unless defined $mask;
             my $regex = _compile_hostmask_regex($mask);
             next unless $regex;
-            my %user_row = %{$row};
+            my $id_user = $row->{id_user};
+            next unless defined $id_user;
+            $users_by_id->{$id_user} ||= { %{$row} };
             push @entries, {
-                mask     => $mask,
-                regex    => $regex,
-                user_row => \%user_row,
+                mask        => $mask,
+                regex       => $regex,
+                id_user     => $id_user,
+                users_by_id => $users_by_id,
             };
         }
         $sth->finish;
@@ -195,14 +206,17 @@ sub _build_hostmask_cache {
         if ($sth && $sth->execute) {
             while (my $row = $sth->fetchrow_hashref) {
                 my @masks = Mediabot::User->split_hostmasks($row->{hostmasks} // '');
+                my $id_user = $row->{id_user};
+                next unless defined $id_user;
+                $users_by_id->{$id_user} ||= { %{$row} };
                 foreach my $mask (@masks) {
                     my $regex = _compile_hostmask_regex($mask);
                     next unless $regex;
-                    my %user_row = %{$row};
                     push @entries, {
-                        mask     => $mask,
-                        regex    => $regex,
-                        user_row => \%user_row,
+                        mask        => $mask,
+                        regex       => $regex,
+                        id_user     => $id_user,
+                        users_by_id => $users_by_id,
                     };
                 }
             }
@@ -220,9 +234,10 @@ sub _build_hostmask_cache {
     }
 
     return {
-        entries  => \@entries,
-        source   => $source,
-        built_at => time,
+        entries     => \@entries,
+        users_by_id => $users_by_id,
+        source      => $source,
+        built_at    => time,
     };
 }
 
