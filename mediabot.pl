@@ -50,6 +50,12 @@ my $BOTNICK_WAS_TRIGGERED = 1;
 my $bootstrap_logger = Mediabot::Log->new(debug_level => 0);
 my $logger = $bootstrap_logger;
 my $mediabot;
+my $loop;
+my $irc;
+my $timer;
+my $sFullParams;
+my $bind_ip;
+my $bNickTriggerCommand;
 
 # +---------------------------------------------------------------------------+
 # !          SUBS DECLARATION                                                 !
@@ -60,6 +66,15 @@ sub catch_term;
 sub catch_int;
 sub reconnect;
 sub getVersion;
+sub run_mediabot;
+sub initialize_daemon_mode;
+sub initialize_loop_and_timers;
+sub create_irc_client;
+sub connect_to_server;
+sub update_pid_file;
+sub handle_radio_pub;
+sub handle_random_quote;
+sub get_validated_delay;
 
 # +---------------------------------------------------------------------------+
 # !          IRC FUNCTIONS                                                    !
@@ -113,90 +128,131 @@ sub on_message_RPL_ENDOFINVITELIST;  # 347
 # +---------------------------------------------------------------------------+
 # !          MAIN                                                             !
 # +---------------------------------------------------------------------------+
-my $sFullParams = join(" ",@ARGV);
-my $sServer;
+run_mediabot();
 
-# Set UTF-8 output for STDOUT and STDERR
-set_utf8_output();
+sub run_mediabot {
+    $sFullParams = join(" ",@ARGV);
+    my $sServer;
 
-# Check command line parameters
-my $result = GetOptions (
-"conf=s" => \$CONFIG_FILE,
-"daemon" => \$MAIN_PROG_DAEMON,
-"check" => \$MAIN_PROG_CHECK_CONFIG,
-"server=s" => \$sServer,
-);
+    # Set UTF-8 output for STDOUT and STDERR
+    set_utf8_output();
 
-unless ($result) {
-    usage("Invalid command-line parameters");
-}
+    # Check command line parameters
+    my $result = GetOptions (
+        "conf=s" => \$CONFIG_FILE,
+        "daemon" => \$MAIN_PROG_DAEMON,
+        "check" => \$MAIN_PROG_CHECK_CONFIG,
+        "server=s" => \$sServer,
+    );
 
-# Check if config file is defined
-unless (defined($CONFIG_FILE)) {
-    usage("You must specify a config file");
-}
-
-# Create Mediabot instance
-$mediabot = Mediabot->new({
-    config_file => $CONFIG_FILE,
-    server      => $sServer,
-});
-
-# Load configuration before anything else
-unless ($mediabot->readConfigFile()) {
-    $logger->error('[FATAL] Could not load configuration, aborting.');
-    exit 1;
-}
-
-# Now that we have the config, we can initialize the logger
-$logger = $mediabot->init_log();
-
-# Trap signals
-init_signals($mediabot->{logger});
-
-
-# Check config
-if ( $MAIN_PROG_CHECK_CONFIG != 0 ) {
-    $mediabot->dumpConfig();
-    $mediabot->clean_and_exit(0);
-}
-
-# Retrieve PID file path and stored PID
-my $pidfile = $mediabot->getPidFile();
-my $pid     = $mediabot->getPidFromFile();
-
-if (defined $pid && $pid =~ /^\d+$/) {
-    
-    # kill 0 just tests “does this process exist and can I signal it?”
-    if (kill 0, $pid) {
-        # process is alive
-        $mediabot->{logger}->log(0, "Mediabot is already running with PID $pid.");
-        $mediabot->{logger}->log(0, "Either kill process $pid or remove stale PID file: $pidfile");
-        $mediabot->clean_and_exit(1);
+    unless ($result) {
+        usage("Invalid command-line parameters");
     }
-    else {
-        # PID file is stale; remove it so a new instance can start
-        if (unlink $pidfile) {
-            $mediabot->{logger}->log(1, "Removed stale PID file: $pidfile");
-        }
-        else {
-            $mediabot->{logger}->log(0, "Could not remove stale PID file '$pidfile': $!");
-            $mediabot->{logger}->log(0, "Please remove it manually before restarting.");
+
+    # Check if config file is defined
+    unless (defined($CONFIG_FILE)) {
+        usage("You must specify a config file");
+    }
+
+    # Create Mediabot instance
+    $mediabot = Mediabot->new({
+        config_file => $CONFIG_FILE,
+        server      => $sServer,
+    });
+
+    # Load configuration before anything else
+    unless ($mediabot->readConfigFile()) {
+        $logger->error('[FATAL] Could not load configuration, aborting.');
+        exit 1;
+    }
+
+    # Now that we have the config, we can initialize the logger
+    $logger = $mediabot->init_log();
+
+    # Trap signals
+    init_signals($mediabot->{logger});
+
+    # Check config
+    if ( $MAIN_PROG_CHECK_CONFIG != 0 ) {
+        $mediabot->dumpConfig();
+        $mediabot->clean_and_exit(0);
+    }
+
+    # Retrieve PID file path and stored PID
+    my $pidfile = $mediabot->getPidFile();
+    my $pid     = $mediabot->getPidFromFile();
+
+    if (defined $pid && $pid =~ /^\d+$/) {
+
+        # kill 0 just tests “does this process exist and can I signal it?”
+        if (kill 0, $pid) {
+            # process is alive
+            $mediabot->{logger}->log(0, "Mediabot is already running with PID $pid.");
+            $mediabot->{logger}->log(0, "Either kill process $pid or remove stale PID file: $pidfile");
             $mediabot->clean_and_exit(1);
         }
+        else {
+            # PID file is stale; remove it so a new instance can start
+            if (unlink $pidfile) {
+                $mediabot->{logger}->log(1, "Removed stale PID file: $pidfile");
+            }
+            else {
+                $mediabot->{logger}->log(0, "Could not remove stale PID file '$pidfile': $!");
+                $mediabot->{logger}->log(0, "Please remove it manually before restarting.");
+                $mediabot->clean_and_exit(1);
+            }
+        }
     }
+
+    ($MAIN_PROG_VERSION,$MAIN_GIT_VERSION) = $mediabot->getVersion();
+
+    $logger->info("mediabot_v3 Copyright (C) 2019-2025 teuk");
+    $logger->info("Mediabot v$MAIN_PROG_VERSION starting with config file $CONFIG_FILE");
+
+    # Daemon mode actions
+    initialize_daemon_mode() if $MAIN_PROG_DAEMON;
+
+    my $sStartedMode = ( $MAIN_PROG_DAEMON ? "background" : "foreground");
+    my $MAIN_PROG_DEBUG = $mediabot->getDebugLevel();
+    $mediabot->{logger}->log(0,"Mediabot v$MAIN_PROG_VERSION started in $sStartedMode with debug level $MAIN_PROG_DEBUG");
+
+    # Initialize Database instance
+    $mediabot->{db} = Mediabot::DB->new($mediabot->{conf}, $mediabot->{logger});
+    $mediabot->{dbh} = $mediabot->{db}->dbh;  # for compatibility with old code
+
+    # Check USER table and fail if not present
+    $mediabot->dbCheckTables();
+
+    # Init authentication object
+    $mediabot->init_auth();
+
+    # Log out all user at start
+    $mediabot->dbLogoutUsers();
+
+    # Populate channels from database
+    $mediabot->populateChannels();
+
+    # Pick IRC Server
+    $mediabot->pickServer();
+
+    # Initialize last_responder_ts
+    $mediabot->setLastReponderTs(0);
+
+    # Initialize hailo
+    $mediabot->init_hailo();
+
+    initialize_loop_and_timers();
+
+    $irc = create_irc_client();
+    $mediabot->setIrc($irc);
+    $loop->add($irc);
+
+    $bind_ip = $mediabot->{conf}->get('connection.CONN_BIND_IP');
+    $bNickTriggerCommand = $mediabot->getNickTrigger();
+    connect_to_server();
 }
 
-
-($MAIN_PROG_VERSION,$MAIN_GIT_VERSION) = $mediabot->getVersion();
-
-
-
-$logger->info("mediabot_v3 Copyright (C) 2019-2025 teuk");
-$logger->info("Mediabot v$MAIN_PROG_VERSION starting with config file $CONFIG_FILE");
-
-# Daemon mode actions
-if ($MAIN_PROG_DAEMON) {
+sub initialize_daemon_mode {
     $mediabot->{logger}->log(0, "Starting in daemon mode...");
     $mediabot->{logger}->log(1, "Logfile: " . $mediabot->getLogFile());
 
@@ -244,147 +300,106 @@ if ($MAIN_PROG_DAEMON) {
     $mediabot->{logger}->log(1, "Daemon process started successfully.");
 }
 
-my $sStartedMode = ( $MAIN_PROG_DAEMON ? "background" : "foreground");
-my $MAIN_PROG_DEBUG = $mediabot->getDebugLevel();
-$mediabot->{logger}->log(0,"Mediabot v$MAIN_PROG_VERSION started in $sStartedMode with debug level $MAIN_PROG_DEBUG");
+sub initialize_loop_and_timers {
+    $loop = IO::Async::Loop->new;
+    $mediabot->setLoop($loop);
 
-# Initialize Database instance
-$mediabot->{db} = Mediabot::DB->new($mediabot->{conf}, $mediabot->{logger});
-$mediabot->{dbh} = $mediabot->{db}->dbh;  # for compatibility with old code
+    $timer = IO::Async::Timer::Periodic->new(
+        interval => 5,
+        on_tick  => \&on_timer_tick,
+    );
+    $mediabot->setMainTimerTick($timer);
 
-# Check USER table and fail if not present
-$mediabot->dbCheckTables();
+    my $channel_hash_timer = IO::Async::Timer::Periodic->new(
+        interval => 60,
+        on_tick  => sub {
+            $mediabot->refresh_channel_hashes;
+        },
+    );
+    $channel_hash_timer->start;
+    $loop->add($channel_hash_timer);
+}
 
-# Init authentication object
-$mediabot->init_auth();
+sub create_irc_client {
+    return Net::Async::IRC->new(
+        on_message_text                  => \&on_private,
+        on_message_motd                  => \&on_motd,
+        on_message_INVITE                => \&on_message_INVITE,
+        on_message_KICK                  => \&on_message_KICK,
+        on_message_MODE                  => \&on_message_MODE,
+        on_message_NICK                  => \&on_message_NICK,
+        on_message_NOTICE                => \&on_message_NOTICE,
+        on_message_QUIT                  => \&on_message_QUIT,
+        on_message_PART                  => \&on_message_PART,
+        on_message_PRIVMSG               => \&on_message_PRIVMSG,
+        on_message_TOPIC                 => \&on_message_TOPIC,
+        on_message_LIST                  => \&on_message_LIST,
+        on_message_RPL_NAMEREPLY         => \&on_message_RPL_NAMEREPLY,
+        on_message_RPL_ENDOFNAMES        => \&on_message_RPL_ENDOFNAMES,
+        on_message_WHO                   => \&on_message_WHO,
+        on_message_WHOIS                 => \&on_message_WHOIS,
+        on_message_WHOWAS                => \&on_message_WHOWAS,
+        on_message_JOIN                  => \&on_message_JOIN,
+        on_message_001                   => \&on_message_001,
+        on_message_002                   => \&on_message_002,
+        on_message_003                   => \&on_message_003,
+        on_message_004                   => \&on_message_004,
+        on_message_005                   => \&on_message_005,
+        on_message_RPL_WHOISUSER         => \&on_message_RPL_WHOISUSER,
+        on_message_ERROR                 => \&on_message_ERROR,
+        on_message_KILL                  => \&on_message_KILL,
+        on_message_SERVER                => \&on_message_SERVER,
+        on_message_RPL_TOPIC             => \&on_message_RPL_TOPIC,
+        on_message_RPL_TOPICWHOTIME      => \&on_message_RPL_TOPICWHOTIME,
+        on_message_RPL_LIST              => \&on_message_RPL_LIST,
+        on_message_RPL_LISTEND           => \&on_message_RPL_LISTEND,
+        on_message_RPL_WHOREPLY          => \&on_message_RPL_WHOREPLY,
+        on_message_RPL_ENDOFWHO          => \&on_message_RPL_ENDOFWHO,
+        on_message_RPL_WHOISCHANNELS     => \&on_message_RPL_WHOISCHANNELS,
+        on_message_RPL_WHOISSERVER       => \&on_message_RPL_WHOISSERVER,
+        on_message_RPL_WHOISIDLE         => \&on_message_RPL_WHOISIDLE,
+        on_message_ERR_NICKNAMEINUSE     => \&on_message_ERR_NICKNAMEINUSE,
+        on_message_RPL_INVITING          => \&on_message_RPL_INVITING,
+        on_message_RPL_INVITELIST        => \&on_message_RPL_INVITELIST,
+        on_message_RPL_ENDOFINVITELIST   => \&on_message_RPL_ENDOFINVITELIST,
+        on_message_ERR_NEEDMOREPARAMS    => \&on_message_ERR_NEEDMOREPARAMS,
+    );
+}
 
-# Log out all user at start
-$mediabot->dbLogoutUsers();
+sub connect_to_server {
+    my $sConnectionNick   = $mediabot->getConnectionNick();
+    my $sServerPass       = $mediabot->getServerPass();
+    my $sServerPassDisplay = ( $sServerPass eq "" ? "none defined" : $sServerPass );
 
-# Populate channels from database
-$mediabot->populateChannels();
+    $mediabot->{logger}->log(
+        0,
+        "Trying to connect to " . $mediabot->getServerHostname() . ":" . $mediabot->getServerPort() .
+        " (pass : $sServerPassDisplay)"
+    );
 
-# Pick IRC Server
-$mediabot->pickServer();
+    my %bind_opts;
+    if ($bind_ip) {
+        %bind_opts = (
+            local_host => $bind_ip,
+            connect    => { local_host => $bind_ip },
+            ( $bind_ip =~ /:/ ? ( family => 'inet6' ) : () ),
+        );
+    }
 
-# Initialize last_responder_ts
-$mediabot->setLastReponderTs(0);
+    my $login = $irc->login(
+        pass     => $sServerPass,
+        nick     => $sConnectionNick,
+        host     => $mediabot->getServerHostname(),
+        service  => $mediabot->getServerPort(),
+        user     => $mediabot->getUserName(),
+        realname => $mediabot->getIrcName(),
+        %bind_opts,
+        on_login => \&on_login,
+    );
 
-# Initialize hailo
-$mediabot->init_hailo();
-
-# Initialize IO::Async loop
-my $loop = IO::Async::Loop->new;
-$mediabot->setLoop($loop);
-
-# Initialize partyline
-#my $partyline = Mediabot::Partyline->new(
-#    bot  => $mediabot,
-#    loop => $loop,
-#    port => $mediabot->{conf}->get("main.PARTYLINE_PORT"),
-#);
-#$mediabot->{partyline} = $partyline;
-#my $partyline_port = $mediabot->{partyline}->get_port;
-#$mediabot->{logger}->log(3, "Partyline port is: $partyline_port");
-
-# Set up main timer
-my $timer = IO::Async::Timer::Periodic->new(
-interval => 5,
-on_tick => \&on_timer_tick,
-);
-$mediabot->setMainTimerTick($timer);
-
-# Set up channel hash refresh timer
-my $channel_hash_timer = IO::Async::Timer::Periodic->new(
-    interval => 60, # toutes les 60 secondes
-    on_tick  => sub {
-        $mediabot->refresh_channel_hashes;
-    },
-);
-$channel_hash_timer->start;
-$loop->add($channel_hash_timer);
-
-my $irc = Net::Async::IRC->new(
-    on_message_text                  => \&on_private,
-    on_message_motd                  => \&on_motd,
-    on_message_INVITE                => \&on_message_INVITE,
-    on_message_KICK                  => \&on_message_KICK,
-    on_message_MODE                  => \&on_message_MODE,
-    on_message_NICK                  => \&on_message_NICK,
-    on_message_NOTICE                => \&on_message_NOTICE,
-    on_message_QUIT                  => \&on_message_QUIT,
-    on_message_PART                  => \&on_message_PART,
-    on_message_PRIVMSG               => \&on_message_PRIVMSG,
-    on_message_TOPIC                 => \&on_message_TOPIC,
-    on_message_LIST                  => \&on_message_LIST,
-    on_message_RPL_NAMEREPLY         => \&on_message_RPL_NAMEREPLY,
-    on_message_RPL_ENDOFNAMES        => \&on_message_RPL_ENDOFNAMES,
-    on_message_WHO                   => \&on_message_WHO,
-    on_message_WHOIS                 => \&on_message_WHOIS,
-    on_message_WHOWAS                => \&on_message_WHOWAS,
-    on_message_JOIN                  => \&on_message_JOIN,
-    on_message_001                   => \&on_message_001,
-    on_message_002                   => \&on_message_002,
-    on_message_003                   => \&on_message_003,
-    on_message_004                   => \&on_message_004,
-    on_message_005                   => \&on_message_005,
-    on_message_RPL_WHOISUSER         => \&on_message_RPL_WHOISUSER,
-    on_message_ERROR                 => \&on_message_ERROR,
-    on_message_KILL                  => \&on_message_KILL,
-    on_message_SERVER                => \&on_message_SERVER,
-    on_message_RPL_TOPIC             => \&on_message_RPL_TOPIC,
-    on_message_RPL_TOPICWHOTIME      => \&on_message_RPL_TOPICWHOTIME,
-    on_message_RPL_LIST              => \&on_message_RPL_LIST,
-    on_message_RPL_LISTEND           => \&on_message_RPL_LISTEND,
-    on_message_RPL_WHOREPLY          => \&on_message_RPL_WHOREPLY,
-    on_message_RPL_ENDOFWHO          => \&on_message_RPL_ENDOFWHO,
-    on_message_RPL_WHOISCHANNELS     => \&on_message_RPL_WHOISCHANNELS,
-    on_message_RPL_WHOISSERVER       => \&on_message_RPL_WHOISSERVER,
-    on_message_RPL_WHOISIDLE         => \&on_message_RPL_WHOISIDLE,
-    on_message_ERR_NICKNAMEINUSE     => \&on_message_ERR_NICKNAMEINUSE,
-    on_message_RPL_INVITING          => \&on_message_RPL_INVITING,
-    on_message_RPL_INVITELIST        => \&on_message_RPL_INVITELIST,
-    on_message_RPL_ENDOFINVITELIST   => \&on_message_RPL_ENDOFINVITELIST,
-    on_message_ERR_NEEDMOREPARAMS    => \&on_message_ERR_NEEDMOREPARAMS,
-);
-
-# Set up IRC object
-$mediabot->setIrc($irc);
-
-# Add IRC object to the loop
-$loop->add($irc);
-
-my $sConnectionNick = $mediabot->getConnectionNick();
-my $sServerPass = $mediabot->getServerPass();
-my $sServerPassDisplay = ( $sServerPass eq "" ? "none defined" : $sServerPass );
-my $bNickTriggerCommand =$mediabot->getNickTrigger();
-$mediabot->{logger}->log(0,"Trying to connect to " . $mediabot->getServerHostname() . ":" . $mediabot->getServerPort() . " (pass : $sServerPassDisplay)");
-
-my $bind_ip = $mediabot->{conf}->get('connection.CONN_BIND_IP');
-
-my $login = $irc->login(
-    pass     => $sServerPass,
-    nick     => $sConnectionNick,
-    host     => $mediabot->getServerHostname(),
-    service  => $mediabot->getServerPort(),
-    user     => $mediabot->getUserName(),
-    realname => $mediabot->getIrcName(),
-
-    # --- BIND IP (optionnel, si défini dans [connection].CONN_BIND_IP) ---
-    ( $bind_ip ? (
-        local_host => $bind_ip,                      # chemin standard IO::Async
-        connect    => { local_host => $bind_ip },    # compat anciennes versions
-        ( $bind_ip =~ /:/ ? ( family => 'inet6' ) : () ),  # si IPv6
-    ) : () ),
-
-    on_login => \&on_login,
-);
-
-
-$login->get;
-
-# Start main loop
-$loop->run;
+    $login->get;
+    $loop->run;
+}
 
 # +---------------------------------------------------------------------------+
 # !          SUBS                                                             !
@@ -431,21 +446,116 @@ sub log_debug_args {
     $mediabot->{logger}->log(5, "$context args: $dump");
 }
 
+sub update_pid_file {
+    my $sPidFilename = $mediabot->{conf}->get('main.MAIN_PID_FILE');
+    return unless $sPidFilename;
+
+    unless (open PID, ">$sPidFilename") {
+        $mediabot->{logger}->error("Could not open $sPidFilename for writing.");
+        return;
+    }
+
+    print PID "$$";
+    close PID;
+}
+
+sub handle_radio_pub {
+    return unless defined($mediabot->{conf}->get('main.MAIN_PID_FILE'));
+    my $radioPubDelay = get_validated_delay(
+        config_key    => 'radio.RADIO_PUB',
+        default_value => 10800,
+        min_value     => 900,
+        error_message => "Mediabot was not designed to spam channels, please set RADIO_PUB to a value greater or equal than 900 seconds in [radio] section of $CONFIG_FILE",
+    );
+    return unless defined $radioPubDelay;
+    return unless ((time - $mediabot->getLastRadioPub()) > $radioPubDelay);
+
+    my $sQuery = "SELECT name FROM CHANNEL,CHANNEL_SET,CHANSET_LIST WHERE CHANNEL.id_channel=CHANNEL_SET.id_channel AND CHANNEL_SET.id_chanset_list=CHANSET_LIST.id_chanset_list AND CHANSET_LIST.chanset LIKE 'RadioPub'";
+    my $sth = $mediabot->getDbh->prepare($sQuery);
+    unless ($sth->execute()) {
+        $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
+        return;
+    }
+
+    while (my $ref = $sth->fetchrow_hashref()) {
+        my $curChannel = $ref->{'name'};
+        $mediabot->{logger}->log(3,"RadioPub on $curChannel");
+        my $currentTitle = $mediabot->getRadioCurrentSong();
+        if ( $currentTitle ne "Unknown" ) {
+            $mediabot->displayRadioCurrentSong(undef,undef,$curChannel,undef);
+        }
+        else {
+            $mediabot->{logger}->log(3,"RadioPub skipped for $curChannel, title is $currentTitle");
+        }
+    }
+
+    $sth->finish;
+    $mediabot->setLastRadioPub(time);
+}
+
+sub handle_random_quote {
+    return unless defined($mediabot->{conf}->get('main.RANDOM_QUOTE'));
+    my $randomQuoteDelay = get_validated_delay(
+        config_key    => 'main.RANDOM_QUOTE',
+        default_value => 10800,
+        min_value     => 900,
+        error_message => "Mediabot was not designed to spam channels, please set RANDOM_QUOTE to a value greater or equal than 900 seconds in [main] section of $CONFIG_FILE",
+    );
+    return unless defined $randomQuoteDelay;
+    return unless ((time - $mediabot->getLastRandomQuote()) > $randomQuoteDelay);
+
+    my $sQuery = "SELECT name FROM CHANNEL,CHANNEL_SET,CHANSET_LIST WHERE CHANNEL.id_channel=CHANNEL_SET.id_channel AND CHANNEL_SET.id_chanset_list=CHANSET_LIST.id_chanset_list AND CHANSET_LIST.chanset LIKE 'RandomQuote'";
+    my $sth = $mediabot->getDbh->prepare($sQuery);
+    unless ($sth->execute()) {
+        $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
+        return;
+    }
+
+    while (my $ref = $sth->fetchrow_hashref()) {
+        my $curChannel = $ref->{'name'};
+        $mediabot->{logger}->log(3,"RandomQuote on $curChannel");
+        my $quoteQuery = "SELECT * FROM QUOTES,CHANNEL,USER WHERE QUOTES.id_channel=CHANNEL.id_channel AND QUOTES.id_user=USER.id_user AND CHANNEL.name=? ORDER BY RAND() LIMIT 1";
+        my $sth2 = $mediabot->getDbh->prepare($quoteQuery);
+        unless ($sth2->execute($curChannel)) {
+            $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $quoteQuery);
+            $sth2->finish;
+            next;
+        }
+
+        if (my $ref_quote = $sth2->fetchrow_hashref()) {
+            my $sQuoteId = $ref_quote->{'id_quotes'};
+            my $sQuote = $ref_quote->{'quotetext'};
+            my $id_q = String::IRC->new($sQuoteId)->bold;
+            $mediabot->botPrivmsg($curChannel,"[id: $id_q] $sQuote");
+        }
+
+        $sth2->finish;
+    }
+
+    $sth->finish;
+    $mediabot->setLastRandomQuote(time);
+}
+
+sub get_validated_delay {
+    my (%opts) = @_;
+    my $value = $mediabot->{conf}->get($opts{config_key});
+    $value = $opts{default_value} unless defined $value;
+
+    if ($value < $opts{min_value}) {
+        $mediabot->{logger}->log(0,$opts{error_message});
+        return;
+    }
+
+    return $value;
+}
+
 sub on_timer_tick {
     my @params = @_;
 
     $mediabot->{logger}->log(5, "on_timer_tick \@params (): " . Dumper(@params));
     $mediabot->{logger}->log(5,"on_timer_tick() tick");
     
-    # Update pid file
-    my $sPidFilename = $mediabot->{conf}->get('main.MAIN_PID_FILE');
-    unless (open PID, ">$sPidFilename") {
-        $mediabot->{logger}->error("Could not open $sPidFilename for writing.");
-    }
-    else {
-        print PID "$$";
-        close PID;
-    }
+    update_pid_file();
     
     # Check connection status and reconnect if not connected
     unless ($irc->is_connected) {
@@ -462,73 +572,8 @@ sub on_timer_tick {
         }
     }
     
-    # Check channels with chanset +RadioPub
-    if (defined($mediabot->{conf}->get('main.MAIN_PID_FILE'))) {
-    my $radioPubDelay = defined($mediabot->{conf}->get('radio.RADIO_PUB')) ? $mediabot->{conf}->get('radio.RADIO_PUB') : 10800;
-    unless ($radioPubDelay >= 900) {
-        $mediabot->{logger}->log(0,"Mediabot was not designed to spam channels, please set RADIO_PUB to a value greater or equal than 900 seconds in [radio] section of $CONFIG_FILE");
-    }
-    elsif ((time - $mediabot->getLastRadioPub()) > $radioPubDelay ) {
-        my $sQuery = "SELECT name FROM CHANNEL,CHANNEL_SET,CHANSET_LIST WHERE CHANNEL.id_channel=CHANNEL_SET.id_channel AND CHANNEL_SET.id_chanset_list=CHANSET_LIST.id_chanset_list AND CHANSET_LIST.chanset LIKE 'RadioPub'";
-        my $sth = $mediabot->getDbh->prepare($sQuery);
-        unless ($sth->execute()) {
-            $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
-        }
-        else {
-            while (my $ref = $sth->fetchrow_hashref()) {
-                my $curChannel = $ref->{'name'};
-                $mediabot->{logger}->log(3,"RadioPub on $curChannel");
-                my $currentTitle = $mediabot->getRadioCurrentSong();
-                if ( $currentTitle ne "Unknown" ) {
-                    $mediabot->displayRadioCurrentSong(undef,undef,$curChannel,undef);
-                }
-                else {
-                    $mediabot->{logger}->log(3,"RadioPub skipped for $curChannel, title is $currentTitle");
-                }
-            }
-        }
-        $sth->finish;
-        $mediabot->setLastRadioPub(time);
-    }
-}
-
-# Check channels with chanset +RandomQuote
-if (defined($mediabot->{conf}->get('main.RANDOM_QUOTE'))) {
-    my $randomQuoteDelay = defined($mediabot->{conf}->get('main.RANDOM_QUOTE')) ? $mediabot->{conf}->get('main.RANDOM_QUOTE') : 10800;
-    unless ($randomQuoteDelay >= 900) {
-        $mediabot->{logger}->log(0,"Mediabot was not designed to spam channels, please set RANDOM_QUOTE to a value greater or equal than 900 seconds in [main] section of $CONFIG_FILE");
-    }
-    elsif ((time - $mediabot->getLastRandomQuote()) > $randomQuoteDelay ) {
-        my $sQuery = "SELECT name FROM CHANNEL,CHANNEL_SET,CHANSET_LIST WHERE CHANNEL.id_channel=CHANNEL_SET.id_channel AND CHANNEL_SET.id_chanset_list=CHANSET_LIST.id_chanset_list AND CHANSET_LIST.chanset LIKE 'RandomQuote'";
-        my $sth = $mediabot->getDbh->prepare($sQuery);
-        unless ($sth->execute()) {
-            $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
-        }
-        else {
-            while (my $ref = $sth->fetchrow_hashref()) {
-                my $curChannel = $ref->{'name'};
-                $mediabot->{logger}->log(3,"RandomQuote on $curChannel");
-                my $sQuery = "SELECT * FROM QUOTES,CHANNEL,USER WHERE QUOTES.id_channel=CHANNEL.id_channel AND QUOTES.id_user=USER.id_user AND CHANNEL.name=? ORDER BY RAND() LIMIT 1";
-                my $sth2 = $mediabot->getDbh->prepare($sQuery);
-                unless ($sth2->execute($curChannel)) {
-                    $mediabot->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
-                }
-                else {
-                    if (my $ref = $sth2->fetchrow_hashref()) {
-                        my $sQuoteId = $ref->{'id_quotes'};
-                        my $sQuoteNick = $ref->{'nickname'};
-                        my $sQuote = $ref->{'quotetext'};
-                        my $id_q = String::IRC->new($sQuoteId)->bold;
-                        $mediabot->botPrivmsg($curChannel,"[id: $id_q] $sQuote");
-                    }
-                }
-                $sth2->finish;
-            }
-        }
-        $sth->finish;
-        $mediabot->setLastRandomQuote(time);
-    }
-}
+    handle_radio_pub();
+    handle_random_quote();
 }
 
 sub on_message_NOTICE {
@@ -1400,94 +1445,14 @@ sub on_message_ERR_NEEDMOREPARAMS {
 }
 
 sub reconnect {
-    # Pick IRC Server
     $mediabot->pickServer();
-        
-    $loop = IO::Async::Loop->new;
-    $mediabot->setLoop($loop);
-        
-    $timer = IO::Async::Timer::Periodic->new(
-    interval => 5,
-    on_tick => \&on_timer_tick,
-    );
-    $mediabot->setMainTimerTick($timer);
-    
-    $irc = Net::Async::IRC->new(
-        on_message_text                  => \&on_private,
-        on_message_motd                  => \&on_motd,
-        on_message_INVITE                => \&on_message_INVITE,
-        on_message_KICK                  => \&on_message_KICK,
-        on_message_MODE                  => \&on_message_MODE,
-        on_message_NICK                  => \&on_message_NICK,
-        on_message_NOTICE                => \&on_message_NOTICE,
-        on_message_QUIT                  => \&on_message_QUIT,
-        on_message_PART                  => \&on_message_PART,
-        on_message_PRIVMSG               => \&on_message_PRIVMSG,
-        on_message_TOPIC                 => \&on_message_TOPIC,
-        on_message_LIST                  => \&on_message_LIST,
-        on_message_RPL_NAMEREPLY         => \&on_message_RPL_NAMEREPLY,
-        on_message_RPL_ENDOFNAMES        => \&on_message_RPL_ENDOFNAMES,
-        on_message_WHO                   => \&on_message_WHO,
-        on_message_WHOIS                 => \&on_message_WHOIS,
-        on_message_WHOWAS                => \&on_message_WHOWAS,
-        on_message_JOIN                  => \&on_message_JOIN,
-        on_message_001                   => \&on_message_001,
-        on_message_002                   => \&on_message_002,
-        on_message_003                   => \&on_message_003,
-        on_message_004                   => \&on_message_004,
-        on_message_005                   => \&on_message_005,
-        on_message_RPL_WHOISUSER         => \&on_message_RPL_WHOISUSER,
-        on_message_ERROR                 => \&on_message_ERROR,
-        on_message_KILL                  => \&on_message_KILL,
-        on_message_SERVER                => \&on_message_SERVER,
-        on_message_RPL_TOPIC             => \&on_message_RPL_TOPIC,
-        on_message_RPL_TOPICWHOTIME      => \&on_message_RPL_TOPICWHOTIME,
-        on_message_RPL_LIST              => \&on_message_RPL_LIST,
-        on_message_RPL_LISTEND           => \&on_message_RPL_LISTEND,
-        on_message_RPL_WHOREPLY          => \&on_message_RPL_WHOREPLY,
-        on_message_RPL_ENDOFWHO          => \&on_message_RPL_ENDOFWHO,
-        on_message_RPL_WHOISCHANNELS     => \&on_message_RPL_WHOISCHANNELS,
-        on_message_RPL_WHOISSERVER       => \&on_message_RPL_WHOISSERVER,
-        on_message_RPL_WHOISIDLE         => \&on_message_RPL_WHOISIDLE,
-        on_message_ERR_NICKNAMEINUSE     => \&on_message_ERR_NICKNAMEINUSE,
-        on_message_RPL_INVITING          => \&on_message_RPL_INVITING,
-        on_message_RPL_INVITELIST        => \&on_message_RPL_INVITELIST,
-        on_message_RPL_ENDOFINVITELIST   => \&on_message_RPL_ENDOFINVITELIST,
-        on_message_ERR_NEEDMOREPARAMS    => \&on_message_ERR_NEEDMOREPARAMS,
-    );
-
+    initialize_loop_and_timers();
+    $irc = create_irc_client();
     $mediabot->setIrc($irc);
-    
     $loop->add($irc);
-    
-    $sConnectionNick = $mediabot->getConnectionNick();
-    $sServerPass = $mediabot->getServerPass();
-    $sServerPassDisplay = ( $sServerPass eq "" ? "none defined" : $sServerPass );
-    $bNickTriggerCommand =$mediabot->getNickTrigger();
-    $mediabot->{logger}->log(0,"Trying to connect to " . $mediabot->getServerHostname() . ":" . $mediabot->getServerPort() . " (pass : $sServerPassDisplay)");
-    
-    my $login = $irc->login(
-        pass     => $sServerPass,
-        nick     => $sConnectionNick,
-        host     => $mediabot->getServerHostname(),
-        service  => $mediabot->getServerPort(),
-        user     => $mediabot->getUserName(),
-        realname => $mediabot->getIrcName(),
-
-        # --- BIND IP (optionnel, si défini dans [connection].CONN_BIND_IP) ---
-        ( $bind_ip ? (
-            local_host => $bind_ip,                      # chemin standard IO::Async
-            connect    => { local_host => $bind_ip },    # compat anciennes versions
-            ( $bind_ip =~ /:/ ? ( family => 'inet6' ) : () ),  # si IPv6
-        ) : () ),
-
-        on_login => \&on_login,
-    );
-
-    $login->get;
-    
-    # Start main loop
-    $loop->run;
+    $bind_ip = $mediabot->{conf}->get('connection.CONN_BIND_IP');
+    $bNickTriggerCommand = $mediabot->getNickTrigger();
+    connect_to_server();
 }
 
 sub catch_hup {
