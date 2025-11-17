@@ -110,7 +110,7 @@ sub get_user_from_message {
 
         require Mediabot::User;
         my $user = Mediabot::User->new(\%row);
-        $user->load_level($self->{dbh});
+        $user->load_level($levels_by_id || $self->{dbh});
 
         # DEBUG avant autologin
         $self->_dbg_auth_snapshot('pre-auto', $user, $nick, $fullmask);
@@ -153,10 +153,55 @@ sub invalidate_hostmask_cache {
     delete $self->{_hostmask_cache};
 }
 
+sub invalidate_user_levels_cache {
+    my ($self) = @_;
+    delete $self->{_user_levels_cache};
+    delete $self->{_hostmask_cache}; # hostmask cache embeds level data, rebuild next lookup
+}
+
 sub _ensure_hostmask_cache {
     my ($self) = @_;
     $self->{_hostmask_cache} ||= $self->_build_hostmask_cache;
     return $self->{_hostmask_cache};
+}
+
+sub _ensure_levels_cache {
+    my ($self) = @_;
+    $self->{_user_levels_cache} ||= $self->_build_levels_cache;
+    return $self->{_user_levels_cache};
+}
+
+sub _build_levels_cache {
+    my ($self) = @_;
+
+    my %levels_by_id;
+    my $dbh    = $self->{dbh};
+    my $logger = $self->{logger};
+
+    unless ($dbh) {
+        $logger->log(2, '[user-level-cache] no DB handle available') if $logger;
+        return { levels_by_id => \%levels_by_id, built_at => time };
+    }
+
+    eval {
+        my $sth = $dbh->prepare('SELECT id_user_level, level, description FROM USER_LEVEL');
+        $sth->execute;
+        while (my $row = $sth->fetchrow_hashref) {
+            $levels_by_id{$row->{id_user_level}} = {
+                level       =\> $row->{level},
+                description => $row->{description},
+            };
+        }
+        $sth->finish;
+        1;
+    } or do {
+        $logger->log(1, "[user-level-cache] lookup failed: $@") if $logger;
+    };
+
+    return {
+        levels_by_id => \%levels_by_id,
+        built_at     => time,
+    };
 }
 
 sub _build_hostmask_cache {
@@ -166,6 +211,8 @@ sub _build_hostmask_cache {
     my @entries;
     my $users_by_id = {};
     my $source = 'USER_HOSTMASK';
+    my $levels_cache   = $self->_ensure_levels_cache;
+    my $levels_by_id   = $levels_cache ? ($levels_cache->{levels_by_id} || {}) : {};
 
     eval {
         my $sql = q{
@@ -248,6 +295,19 @@ sub _compile_hostmask_regex {
     $regex =~ s/\\\*/.*/g;
     $regex =~ s/\\\?/.?/g;
     return qr/^$regex/;
+}
+
+sub _populate_user_level_fields {
+    my ($user_row, $levels_by_id) = @_;
+    return unless $user_row && $levels_by_id;
+
+    my $level_id = $user_row->{id_user_level};
+    return unless defined $level_id;
+
+    if (my $level_data = $levels_by_id->{$level_id}) {
+        $user_row->{level}      = $level_data->{level};
+        $user_row->{level_desc} = $level_data->{description};
+    }
 }
 
 

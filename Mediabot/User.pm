@@ -42,8 +42,8 @@ sub new {
         info2        => $args->{info2},
         level_id     => $args->{id_user_level},
         auth         => $args->{auth},
-        level        => undef,
-        level_desc   => undef,
+        level        => $args->{level},
+        level_desc   => $args->{level_desc} // $args->{level_description},
         dbh          => $args->{dbh},  # optional
     };
 
@@ -85,11 +85,26 @@ Will use stored DBH if available.
 =cut
 
 sub load_level {
-    my ($self, $dbh) = @_;
-    $dbh //= $self->{dbh};
-    return unless $dbh && defined $self->{level_id};
+    my ($self, $source) = @_;
+    return unless defined $self->{level_id};
 
-    my $sth = $dbh->prepare("SELECT * FROM USER_LEVEL WHERE id_user_level=?");
+    # If already populated and no source provided, keep cached values
+    return 1 if !$source && defined $self->{level} && defined $self->{level_desc};
+
+    if ($source && ref($source) eq 'HASH') {
+        if (my $level_data = $source->{ $self->{level_id} }) {
+            $self->{level}      = $level_data->{level};
+            $self->{level_desc} = $level_data->{description};
+            return 1;
+        }
+        $source = $self->{dbh}; # fallback to DBH if provided hash had no entry
+    } elsif (!$source) {
+        $source = $self->{dbh};
+    }
+
+    return unless $source;
+
+    my $sth = $source->prepare("SELECT level, description FROM USER_LEVEL WHERE id_user_level=?");
     if ($sth->execute($self->{level_id})) {
         if (my $ref = $sth->fetchrow_hashref) {
             $self->{level}      = $ref->{level};
@@ -97,6 +112,7 @@ sub load_level {
         }
     }
     $sth->finish;
+    return 1;
 }
 
 =head2 maybe_autologin($bot, $matched_hostmask)
