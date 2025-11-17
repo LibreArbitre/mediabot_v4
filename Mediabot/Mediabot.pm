@@ -87,9 +87,8 @@ sub get_user_from_message {
 
     $self->{logger}->log(3, "🔍 get_user_from_message() called with hostmask: '$fullmask'");
 
-    my $cache        = $self->_ensure_hostmask_cache;
-    my $entries      = $cache ? $cache->{entries}      : [];
-    my $levels_by_id = $cache ? $cache->{levels_by_id} : undef;
+    my $cache   = $self->_ensure_hostmask_cache;
+    my $entries = $cache ? $cache->{entries} : [];
     unless ($entries && @{$entries}) {
         $self->{logger}->log(3, "🚫 hostmask cache empty, no user can be matched");
         return;
@@ -99,7 +98,14 @@ sub get_user_from_message {
     ENTRY: foreach my $entry (@{$entries}) {
         next unless $fullmask =~ $entry->{regex};
 
-        my %row = %{ $entry->{user_row} };
+        my $users_by_id = $entry->{users_by_id} || $cache->{users_by_id} || {};
+        my $user_row = $users_by_id->{ $entry->{id_user} };
+        unless ($user_row) {
+            $self->{logger}->log(2, sprintf("[hostmask-cache] missing user row for id=%s", $entry->{id_user} // '?'));
+            next;
+        }
+
+        my %row = %{ $user_row };
         $row{dbh} = $self->{dbh};
 
         require Mediabot::User;
@@ -203,6 +209,7 @@ sub _build_hostmask_cache {
     my $dbh    = $self->{dbh};
     my $logger = $self->{logger};
     my @entries;
+    my $users_by_id = {};
     my $source = 'USER_HOSTMASK';
     my $levels_cache   = $self->_ensure_levels_cache;
     my $levels_by_id   = $levels_cache ? ($levels_cache->{levels_by_id} || {}) : {};
@@ -221,12 +228,14 @@ sub _build_hostmask_cache {
             next unless defined $mask;
             my $regex = _compile_hostmask_regex($mask);
             next unless $regex;
-            my %user_row = %{$row};
-            _populate_user_level_fields(\%user_row, $levels_by_id);
+            my $id_user = $row->{id_user};
+            next unless defined $id_user;
+            $users_by_id->{$id_user} ||= { %{$row} };
             push @entries, {
-                mask     => $mask,
-                regex    => $regex,
-                user_row => \%user_row,
+                mask        => $mask,
+                regex       => $regex,
+                id_user     => $id_user,
+                users_by_id => $users_by_id,
             };
         }
         $sth->finish;
@@ -244,15 +253,17 @@ sub _build_hostmask_cache {
         if ($sth && $sth->execute) {
             while (my $row = $sth->fetchrow_hashref) {
                 my @masks = Mediabot::User->split_hostmasks($row->{hostmasks} // '');
+                my $id_user = $row->{id_user};
+                next unless defined $id_user;
+                $users_by_id->{$id_user} ||= { %{$row} };
                 foreach my $mask (@masks) {
                     my $regex = _compile_hostmask_regex($mask);
                     next unless $regex;
-                    my %user_row = %{$row};
-                    _populate_user_level_fields(\%user_row, $levels_by_id);
                     push @entries, {
-                        mask     => $mask,
-                        regex    => $regex,
-                        user_row => \%user_row,
+                        mask        => $mask,
+                        regex       => $regex,
+                        id_user     => $id_user,
+                        users_by_id => $users_by_id,
                     };
                 }
             }
@@ -270,10 +281,10 @@ sub _build_hostmask_cache {
     }
 
     return {
-        entries      => \@entries,
-        source       => $source,
-        built_at     => time,
-        levels_by_id => $levels_by_id,
+        entries     => \@entries,
+        users_by_id => $users_by_id,
+        source      => $source,
+        built_at    => time,
     };
 }
 
@@ -1040,12 +1051,32 @@ sub get_channel_by_name {
 
 # Get channel object by id
 sub getChannelById {
-	my ($self, $id_channel) = @_;
-	foreach my $chan_name (keys %{ $self->{channels} }) {
-		my $chan = $self->{channels}{$chan_name};
-		return $chan if $chan->{id} == $id_channel;
-	}
-	return undef;
+        my ($self, $id_channel) = @_;
+        foreach my $chan_name (keys %{ $self->{channels} }) {
+                my $chan = $self->{channels}{$chan_name};
+                return $chan if $chan->{id} == $id_channel;
+        }
+        return undef;
+}
+
+# Helper to clear cached per-channel user info when a user's data changes
+sub invalidate_channel_user_cache {
+    my ($self, %args) = @_;
+
+    my $nickname = $args{nickname};
+    return unless defined $nickname && $nickname ne '';
+
+    my $channel_obj;
+    if (defined $args{name}) {
+        $channel_obj = $self->{channels}{ $args{name} };
+    }
+    elsif (defined $args{id}) {
+        $channel_obj = $self->getChannelById($args{id});
+    }
+
+    return unless $channel_obj && $channel_obj->can('invalidate_user_cache');
+
+    $channel_obj->invalidate_user_cache($nickname);
 }
 
 
@@ -1478,35 +1509,51 @@ sub userOnJoin {
     my $user = $self->get_user_from_message($message);
 
     if ($user) {
-        # Check for channel-specific user settings (auto mode and greet)
-        my $sql = "SELECT uc.*, c.* FROM USER_CHANNEL AS uc JOIN CHANNEL AS c ON c.id_channel = uc.id_channel WHERE c.name = ? AND uc.id_user = ?;";
-        $self->{logger}->log(4, $sql);
-        my $sth = $self->{dbh}->prepare($sql);
+        my $info;
 
-        if ($sth->execute($sChannel, $user->id)) {
-            if (my $ref = $sth->fetchrow_hashref()) {
+        if (my $channel_obj = $self->{channels}{$sChannel}) {
+            $info = $channel_obj->get_user_info($user->nickname);
+        } else {
+            # Fallback SQL lookup if no channel object is loaded
+            $info = {
+                level    => 0,
+                automode => 'None',
+                greet    => 'None',
+            };
+            my $sql = "SELECT uc.*, c.* FROM USER_CHANNEL AS uc JOIN CHANNEL AS c ON c.id_channel = uc.id_channel WHERE c.name = ? AND uc.id_user = ?;";
+            $self->{logger}->log(4, $sql);
+            my $sth = $self->{dbh}->prepare($sql);
 
-                # Apply auto mode if defined
-                my $auto_mode = $ref->{automode};
-                if (defined $auto_mode && $auto_mode ne '') {
-                    if ($auto_mode eq 'OP') {
-                        $self->{irc}->send_message("MODE", undef, ($sChannel, "+o", $sNick));
-                    }
-                    elsif ($auto_mode eq 'VOICE') {
-                        $self->{irc}->send_message("MODE", undef, ($sChannel, "+v", $sNick));
-                    }
+            if ($sth->execute($sChannel, $user->id)) {
+                if (my $ref = $sth->fetchrow_hashref()) {
+                    $info->{level}    = $ref->{level}    if defined $ref->{level};
+                    $info->{automode} = $ref->{automode} if defined $ref->{automode};
+                    $info->{greet}    = $ref->{greet}    if defined $ref->{greet};
                 }
+            } else {
+                $self->{logger}->log(1, "userOnJoin() SQL Error: " . $DBI::errstr . " Query: $sql");
+            }
+            $sth->finish;
+        }
 
-                # Send greet message to channel if defined
-                my $greet = $ref->{greet};
-                if (defined $greet && $greet ne '') {
-                    botPrivmsg($self, $sChannel, "($user->{nickname}) $greet");
+        if ($info) {
+            # Apply auto mode if defined
+            my $auto_mode = $info->{automode};
+            if (defined $auto_mode && $auto_mode ne '') {
+                if ($auto_mode eq 'OP') {
+                    $self->{irc}->send_message("MODE", undef, ($sChannel, "+o", $sNick));
+                }
+                elsif ($auto_mode eq 'VOICE') {
+                    $self->{irc}->send_message("MODE", undef, ($sChannel, "+v", $sNick));
                 }
             }
-        } else {
-            $self->{logger}->log(1, "userOnJoin() SQL Error: " . $DBI::errstr . " Query: $sql");
+
+            # Send greet message to channel if defined
+            my $greet = $info->{greet};
+            if (defined $greet && $greet ne '') {
+                botPrivmsg($self, $sChannel, "($user->{nickname}) $greet");
+            }
         }
-        $sth->finish;
     }
 
     # Now check if the channel has a default notice to send on join
@@ -2274,16 +2321,22 @@ sub registerChannel(@) {
 	my ($self,$message,$sNick,$id_channel,$id_user) = @_;
 	my $sQuery = "INSERT INTO USER_CHANNEL (id_user,id_channel,level) VALUES (?,?,500)";
 	my $sth = $self->{dbh}->prepare($sQuery);
-	unless ($sth->execute($id_user,$id_channel)) {
-		$self->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
-		$sth->finish;
-		return 0;
-	}
-	else {
-		logBot($self,$message,undef,"registerChannel","$sNick registered user : $id_user level 500 on channel : $id_channel");
-		$sth->finish;
-		return 1;
-	}
+        unless ($sth->execute($id_user,$id_channel)) {
+                $self->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
+                $sth->finish;
+                return 0;
+        }
+        else {
+                logBot($self,$message,undef,"registerChannel","$sNick registered user : $id_user level 500 on channel : $id_channel");
+                if (my $nickname = $self->getUserhandle($id_user)) {
+                    $self->invalidate_channel_user_cache(
+                        id       => $id_channel,
+                        nickname => $nickname,
+                    );
+                }
+                $sth->finish;
+                return 1;
+        }
 }
 
 # Allows first user creation: register <nickname_in_db> <password>
@@ -4192,6 +4245,10 @@ sub channelAddUser {
         } else {
             $self->{logger}->log(0, "$sNick added $sTargetHandle to $sChannel at level $iTargetLevel");
             logBot($self, $message, $sChannel, "add", @tArgs);
+            $self->invalidate_channel_user_cache(
+                name     => $sChannel,
+                nickname => $sTargetHandle,
+            );
         }
         $sth->finish;
     } else {
@@ -4298,6 +4355,10 @@ sub channelDelUser {
     }
 
     logBot($self, $message, $sChannel, "del", $sTargetHandle);
+    $self->invalidate_channel_user_cache(
+        name     => $sChannel,
+        nickname => $sTargetHandle,
+    );
     botNotice($self, $sNick, "User $sTargetHandle removed from $sChannel");
 }
 
@@ -4404,6 +4465,10 @@ sub userModinfo {
 
             botNotice($self, $sNick, "Set automode $mode on $sChannel for $user_target_handle");
             logBot($self, $message, $sChannel, "modinfo", @tArgs);
+            $self->invalidate_channel_user_cache(
+                name     => $sChannel,
+                nickname => $user_target_handle,
+            );
             return $id_channel;
         };
 
@@ -4429,6 +4494,10 @@ sub userModinfo {
 
             botNotice($self, $sNick, "Set greet (" . ($greet_msg // "none") . ") on $sChannel for $user_target_handle");
             logBot($self, $message, $sChannel, "modinfo", ("greet $user_target_handle", @tArgs));
+            $self->invalidate_channel_user_cache(
+                name     => $sChannel,
+                nickname => $user_target_handle,
+            );
             return $id_channel;
         };
 
@@ -4448,6 +4517,10 @@ sub userModinfo {
 
             botNotice($self, $sNick, "Set level $new_level on $sChannel for $user_target_handle");
             logBot($self, $message, $sChannel, "modinfo", @tArgs);
+            $self->invalidate_channel_user_cache(
+                name     => $sChannel,
+                nickname => $user_target_handle,
+            );
             return $id_channel;
         };
 
@@ -12932,16 +13005,20 @@ sub delUser(@) {
 						unless ($sth->execute($id_user)) {
 							$self->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
 						}
-						$sQuery = "DELETE FROM USER WHERE id_user=?";
-						$sth = $self->{dbh}->prepare($sQuery);
-						unless ($sth->execute($id_user)) {
-							$self->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
-							return undef;
-						}
-						$sth->finish;
-						logBot($self,$message,undef,"deluser","User " . $tArgs[0] . " (id_user : $id_user) has been deleted");
-						return undef;
-					}
+                                                $sQuery = "DELETE FROM USER WHERE id_user=?";
+                                                $sth = $self->{dbh}->prepare($sQuery);
+                                                unless ($sth->execute($id_user)) {
+                                                        $self->{logger}->log(1,"SQL Error : " . $DBI::errstr . " Query : " . $sQuery);
+                                                        return undef;
+                                                }
+                                                $sth->finish;
+                                                logBot($self,$message,undef,"deluser","User " . $tArgs[0] . " (id_user : $id_user) has been deleted");
+                                                foreach my $chan (values %{ $self->{channels} }) {
+                                                        next unless $chan->can('invalidate_user_cache');
+                                                        $chan->invalidate_user_cache($tArgs[0]);
+                                                }
+                                                return undef;
+                                        }
 					else {
 						botNotice($self,$sNick,"Undefined user " . $tArgs[0]);
 					}
