@@ -1,5 +1,25 @@
 # Mediabot - https://teuk.org
 
+### Recent Optimizations (Nov 2025)
+
+This repository has been updated with several security and modernization improvements:
+
+*   **PHP Backend Security:**
+    *   The web administration panel's authentication system has been hardened.
+    *   SQL injection vulnerabilities have been patched by migrating to prepared statements.
+    *   Password storage has been upgraded from the obsolete MySQL `PASSWORD()` function to the modern `password_hash()` standard. A new command-line script (`htdocs/mbadm/tools/set_password.php`) is available for securely setting user passwords.
+
+*   **Database Integrity & Maintenance:**
+    *   A new Perl script (`contrib/tools/prune_logs.pl`) has been added to periodically clean up old records from `ACTIONS_LOG` and `CHANNEL_LOG`, preventing uncontrolled database growth.
+    *   Foreign key constraints with cascading deletes have been defined in `2_add_foreign_keys.sql` to ensure data integrity. When a user or channel is deleted, all their associated data (quotes, channel memberships, etc.) will be cleanly removed.
+
+*   **Frontend Optimization & Modernization:**
+    *   A `npm`-based build process has been introduced (`package.json`).
+    *   JavaScript and CSS assets for the web administration panel are now minified, reducing load times. Run `npm install && npm run build` to generate these files.
+    *   The process of modernizing the backend API from XML to JSON has been initiated, with the status endpoint (`htdocs/mbadm/xml/status.json.php`) serving as an example.
+
+---
+
   Mediabotv3 is a perl Net::Async::IRC bot now tho I started it with Net::IRC which is now deprecated
   It is still a beta version after all these years but a release is coming up
 
@@ -64,7 +84,7 @@ mediabot@mediabot:~/mediabot_v3$ ./mediabot.pl --conf=mediabot.conf
 Can't locate MP3/Tag.pm in @INC (you may need to install the MP3::Tag module) (@INC contains: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.36.0 /usr/local/share/perl/5.36.0 /usr/lib/x86_64-linux-gnu/perl5/5.36 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.36 /usr/share/perl/5.36 /usr/local/lib/site_perl .) at Mediabot/Mediabot.pm line 25.
 BEGIN failed--compilation aborted at Mediabot/Mediabot.pm line 25.
 Compilation failed in require at ./mediabot.pl line 17.
-BEGIN failed--compilation aborted at ./mediabot.pl line 17 (#1)
+BEGIN failed--compilation aborted at ./mediabot.pl line 17. (#1)
     (F) You said to do (or require, or use) a file that couldn't be found.
     Perl looks for the file in all the locations mentioned in @INC, unless
     the file name included the full path to the file.  Perhaps you need
@@ -212,4 +232,3 @@ sudo rm -fv /etc/sudoers.d/mediabot
 ```
 
 Once you did all that, register your bot and see the commands available in Wiki section : https://github.com/teuk/mediabot_v3/wiki
-

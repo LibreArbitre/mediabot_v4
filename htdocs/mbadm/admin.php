@@ -31,7 +31,7 @@
 				gridStatusContainer.enableAutoHeight(true,800,true);
 				gridStatusContainer.init();
 				gridStatusContainer.setColTypes("ro,ro,ro,ro,ro,ro,ro,ro");
-				gridStatusContainer.load("xml/status.xml.php");
+				gridStatusContainer.load("xml/status.json.php", "json");
 			}
 			
 		</script>

@@ -10,13 +10,13 @@
     <title><?php echo PORTAL_NAME; ?></title>
     
     <!-- dhtmlx js functions -->
-		<script type="text/javascript" src="codebase/dhtmlx.js"></script>
+		<script type="text/javascript" src="codebase/dhtmlx.min.js"></script>
 	
 		<!-- dhtmlx css -->
-		<link rel="stylesheet" type="text/css" href="codebase/dhtmlx.css">
+		<link rel="stylesheet" type="text/css" href="codebase/dhtmlx.min.css">
 			
 		<!-- dhtmlxAjax js -->
-		<script type="text/javascript" src="dhtmlxAjax/codebase/dhtmlxcommon.js"></script>
+		<script type="text/javascript" src="dhtmlxAjax/codebase/dhtmlxcommon.min.js"></script>
 
 		<script>
 			

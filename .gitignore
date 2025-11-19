@@ -33,3 +33,4 @@ test_all_commands.pl
 test_log.txt
 test_all_commands.pl
 test_log.txt
+\n# Node.js dependencies\n/node_modules/\n\n# Build artifacts\n*.min.js\n*.min.css\n

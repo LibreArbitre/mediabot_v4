@@ -11,27 +11,28 @@ EOH;
 
 echo ($html);
 
-$id_public_commands_category = $_GET['id_public_commands_category'];
+$id_public_commands_category = isset($_GET['id_public_commands_category']) ? (int)$_GET['id_public_commands_category'] : 0;
 
-mysqli_query($link,"SET NAMES 'utf8'");
-mysqli_query($link,"SET CHARACTER SET utf8");
-mysqli_query($link,"SET COLLATION_CONNECTOIN = 'utf8_general_ci'");
+if ($id_public_commands_category > 0) {
+    $usersQuery = "SELECT * FROM PUBLIC_COMMANDS WHERE id_public_commands_category=? ORDER by command";
+    $stmt = mysqli_prepare($link, $usersQuery);
 
-$usersQuery = "SELECT * FROM PUBLIC_COMMANDS WHERE id_public_commands_category=$id_public_commands_category ORDER by command";
+    if ($stmt) {
+        mysqli_stmt_bind_param($stmt, "i", $id_public_commands_category);
+        mysqli_stmt_execute($stmt);
+        $usersResult = mysqli_stmt_get_result($stmt);
 
-$usersResult=mysqli_query($link,$usersQuery);
-if($usersResult) {
-	if($usersResult->num_rows >= 1) {
-		$usersCellId = 0;
-		while ($usersFields = mysqli_fetch_assoc($usersResult)) {
-			
-			$command = "." . htmlspecialchars($usersFields["command"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
-			$description = htmlspecialchars($usersFields["description"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
-			//$action = _convert($usersFields["action"]);
-			$action = htmlspecialchars($usersFields["action"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
-			$action = preg_replace("/ACTION %c/","/me",$action);
-			$action = preg_replace("/PRIVMSG %c/","",$action);
-			$action = preg_replace("/%n/","nickname",$action);
+        if($usersResult && $usersResult->num_rows >= 1) {
+            $usersCellId = 0;
+            while ($usersFields = mysqli_fetch_assoc($usersResult)) {
+                
+                $command = "." . htmlspecialchars($usersFields["command"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
+                $description = htmlspecialchars($usersFields["description"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
+                //$action = _convert($usersFields["action"]);
+                $action = htmlspecialchars($usersFields["action"], ENT_QUOTES | ENT_SUBSTITUTE | ENT_DISALLOWED);
+                $action = preg_replace("/ACTION %c/","/me",$action);
+                $action = preg_replace("/PRIVMSG %c/","",$action);
+                $action = preg_replace("/%n/","nickname",$action);
 
 $html = <<< EOH
       	<row id="$usersCellId">
@@ -41,10 +42,12 @@ $html = <<< EOH
 				</row>
 EOH;
 
-			echo($html);
-			$usersCellId++;
-		}
-	}
+                echo($html);
+                $usersCellId++;
+            }
+        }
+        mysqli_stmt_close($stmt);
+    }
 }
 
 
