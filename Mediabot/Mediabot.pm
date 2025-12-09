@@ -29,7 +29,6 @@ use Encode;
 use Moose;
 use parent 'Mediabot::Core';
 use Mediabot::LogService qw(logBot logBotAction);
-use Mediabot::Commands qw(mbCommandPublic mbCommandPrivate getReplyTarget);
 use Hailo;
 use Socket;
 use Twitter::API;
