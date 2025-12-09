@@ -27,6 +27,8 @@ use HTML::Entities qw(decode_entities);
 use File::Basename;
 use Encode;
 use Moose;
+use parent 'Mediabot::Core';
+use Mediabot::LogService qw(logBot logBotAction);
 use Hailo;
 use Socket;
 use Twitter::API;
@@ -52,29 +54,6 @@ use Encode qw(encode);
 
 # --- Top of Mediabot.pm (near other 'my' / 'our' declarations)
 my $ALREADY_EXITING = 0;  # re-entrance guard for clean_and_exit
-
-
-sub new {
-    my ($class, $args) = @_;
-
-    my $self = bless {
-        config_file => $args->{config_file} // undef,
-        server      => $args->{server}      // undef,
-        dbh         => $args->{dbh}         // undef,
-        conf        => $args->{conf}        // undef,
-        channels    => {},
-    }, $class;
-
-    # Minimal logging setup
-    require Mediabot::Log;
-    $self->{logger} = Mediabot::Log->new(
-        debug_level => 0,
-        logfile     => undef
-    );
-
-    return $self;
-}
-
 
 
 # Return a Mediabot::User object matching the message prefix, or undef if none matched
@@ -318,155 +297,10 @@ sub _populate_user_level_fields {
 
 
 # Read the configuration file and populate the $self->{conf} object
-sub readConfigFile {
-    my ($self, $file) = @_;
-
-    my $logger = $self->{logger};
-
-    $file //= $self->{config_file}
-        or croak "No config file specified (\$self->{config_file} is empty)";
-
-    unless (-e $file) {
-        $logger->error("Config file '$file' does not exist");
-        return;
-    }
-    unless (-r $file) {
-        $logger->error("Cannot read config file '$file'");
-        return;
-    }
-
-    $logger->info("Loading configuration from '$file'");
-
-    my $conf;
-    eval {
-        require Mediabot::Conf;
-        $conf = Mediabot::Conf->new(undef, $file);
-    };
-    if ($@ or not $conf) {
-        $logger->error("Failed to load configuration: $@");
-        return;
-    }
-
-    $self->{conf} = $conf;
-
-    $logger->info("Configuration loaded successfully");
-    return 1;
-}
 
 # getVersion – retrieves the current local version and compares it to the latest GitHub version
-sub getVersion {
-    my $self = shift;
-    my ($local_version, $remote_version) = ("Undefined", "Undefined");
-    my ($c_major, $c_minor, $c_type, $c_dev_info);
-    my ($r_major, $r_minor, $r_type, $r_dev_info);
 
-    $self->{logger}->log(0, "Reading local version from VERSION file...");
 
-    # Read local VERSION file
-    if (open my $fh, '<', 'VERSION') {
-        chomp($local_version = <$fh>);
-        close $fh;
-        ($c_major, $c_minor, $c_type, $c_dev_info) = $self->getDetailedVersion($local_version);
-    } else {
-        $self->{logger}->log(0, "Unable to read local VERSION file.");
-    }
-
-    if (defined $c_major && defined $c_minor && defined $c_type) {
-        my $suffix = $c_dev_info ? "($c_dev_info)" : '';
-        $self->{logger}->log(0, "-> Mediabot $c_type version $c_major.$c_minor $suffix");
-    } else {
-        $self->{logger}->log(0, "-> Unknown local version format: $local_version");
-    }
-
-    # If we have a valid local version, try fetching the GitHub version
-    if ($local_version ne "Undefined") {
-        $self->{logger}->log(0, "Checking latest version from GitHub...");
-
-        if (open my $gh, '-|', 'curl --connect-timeout 5 -f -s https://raw.githubusercontent.com/teuk/mediabot_v3/master/VERSION') {
-            chomp($remote_version = <$gh>);
-            close $gh;
-            ($r_major, $r_minor, $r_type, $r_dev_info) = $self->getDetailedVersion($remote_version);
-
-            if (defined $r_major && defined $r_minor && defined $r_type) {
-                my $suffix = $r_dev_info ? "($r_dev_info)" : '';
-                $self->{logger}->log(0, "-> GitHub $r_type version $r_major.$r_minor $suffix");
-
-                if ($local_version eq $remote_version) {
-                    $self->{logger}->log(0, "Mediabot is up to date.");
-                } else {
-                    $self->{logger}->log(0, "Update available: $r_type version $r_major.$r_minor $suffix");
-                }
-            } else {
-                $self->{logger}->log(0, "Unknown remote version format: $remote_version");
-            }
-        } else {
-            $self->{logger}->log(0, "Failed to fetch version from GitHub.");
-        }
-    }
-
-    $self->{main_prog_version} = $local_version;
-    return ($local_version, $remote_version);
-}
-
-# getDetailedVersion – parses a version string and returns its components
-sub getDetailedVersion {
-    my ($self, $version_string) = @_;
-
-    # Expecting version format like: 3.0 or 3.0dev-20250614_192031
-    if ($version_string =~ /^(\d+)\.(\d+)$/) {
-        # Stable version
-        return ($1, $2, "stable", undef);
-    } elsif ($version_string =~ /^(\d+)\.(\d+)dev[-_]?([\d_]+)$/) {
-        # Dev version like 3.0dev-20250614_192031
-        return ($1, $2, "devel", $3);
-    } else {
-        return (undef, undef, undef, undef);
-    }
-}
-
-# Get the debug level from the configuration
-sub getDebugLevel {
-	my $self = shift;
-	return $self->{conf}->get('main.MAIN_PROG_DEBUG');
-}
-
-# Get the log file path from the configuration
-sub getLogFile(@) {
-	my $self = shift;
-	return $self->{conf}->get('main.MAIN_LOG_FILE');
-}
-
-# Dump the configuration to STDERR
-sub dumpConfig {
-    my ($self) = @_;
-
-    my %conf = $self->{conf}->all;
-    return unless %conf;
-
-    print STDERR "\e[1m=== Mediabot configuration dump ===\e[0m\n";
-
-    foreach my $key (sort keys %conf) {
-        my $val = $conf{$key};
-
-        # Formattage section.clé en deux parties si souhaité
-        if ($key =~ /^(.+?)\.(.+)$/) {
-            my ($section, $subkey) = ($1, $2);
-            printf STDERR "  \e[1;36m[%s]\e[0m \e[1;33m%-18s\e[0m : %s\n", $section, $subkey, _format_val($val);
-        } else {
-            printf STDERR "  \e[1;34m%-20s\e[0m : %s\n", $key, _format_val($val);
-        }
-    }
-
-    print STDERR "\n\e[1m===================================\e[0m\n";
-}
-
-# Format a single value with color
-sub _format_val {
-    my ($val) = @_;
-    return "\e[31m(undef)\e[0m" unless defined $val;
-    return "\e[33m[empty]\e[0m" if $val eq '';
-    return "\e[32m$val\e[0m";
-}
 
 # Get the main configuration object
 sub getMainConfCfg(@) {
@@ -1123,110 +957,6 @@ sub noticeConsoleChan {
         botNotice($self, $name, $sMsg);
     } else {
         $self->{logger}->log(1, "⚠️ No console channel defined! Run ./configure to set up the bot.");
-    }
-}
-
-
-# Log a bot command to the ACTIONS_LOG table, optionally linked to a user and/or channel
-sub logBot {
-    my ($self, $message, $channel, $action, @args) = @_;
-
-    return unless $self->{dbh};  # Abort if the database handle is not available
-
-    # Try to retrieve the User object from the message
-    my $user = $self->get_user_from_message($message);
-
-    my $user_id   = $user ? $user->id       : undef;
-    my $user_name = $user ? $user->nickname : 'Unknown user';
-    my $hostmask  = $message->prefix        // 'unknown';
-
-    # Retrieve the channel ID from the channel object if available
-    my $channel_id;
-    if (defined $channel && exists $self->{channels}{$channel}) {
-        $channel_id = $self->{channels}{$channel}->get_id;
-    }
-
-    # Normalize the argument string (handle undefined values)
-    my $args_string = @args ? join(' ', map { defined($_) ? $_ : '' } @args) : '';
-
-    # Prepare the SQL query
-    my $sql = "INSERT INTO ACTIONS_LOG (ts, id_user, id_channel, hostmask, action, args) VALUES (?, ?, ?, ?, ?, ?)";
-    my $sth = $self->{dbh}->prepare($sql) or do {
-        $self->{logger}->log(0, "logBot() SQL prepare failed: $DBI::errstr");
-        return;
-    };
-
-    # Generate current timestamp in SQL format
-    my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime(time));
-
-    # Execute the insert with bound parameters
-    unless ($sth->execute($timestamp, $user_id, $channel_id, $hostmask, $action, $args_string)) {
-        $self->{logger}->log(0, "logBot() SQL error: $DBI::errstr — Query: $sql");
-        return;
-    }
-
-    # Format and display a console log message
-    my $log_msg = "($user_name : $hostmask) command $action";
-    $log_msg .= " $args_string" if $args_string ne '';
-    $log_msg .= " on $channel"  if defined $channel;
-
-    $self->noticeConsoleChan($log_msg);
-    $self->{logger}->log(3, "logBot() $log_msg");
-
-    $sth->finish;
-}
-
-
-
-# Log bot action into the CHANNEL_LOG table
-# Handles JOIN, PART, PUBLIC, ACTION, NOTICE, KICK, QUIT, etc.
-sub logBotAction(@) {
-    my ($self, $message, $eventtype, $sNick, $sChannel, $sText) = @_;
-
-    my $sUserhost = "";
-    $sUserhost = $message->prefix if defined $message;
-
-    # Optional debug
-    if (defined $sChannel) {
-        $self->{logger}->log(5, "logBotAction() eventtype = $eventtype chan = $sChannel nick = $sNick text = $sText");
-    } else {
-        $self->{logger}->log(5, "logBotAction() eventtype = $eventtype nick = $sNick text = $sText");
-    }
-
-    $self->{logger}->log(5, "logBotAction() " . Dumper($message)) if defined($self->{logger}->{debug}) && $self->{logger}->{debug} >= 5;
-
-    my $id_channel;
-
-    # Only look up channel ID if channel is defined (not for QUIT events)
-    if (defined $sChannel) {
-        my $sQuery = "SELECT id_channel FROM CHANNEL WHERE name = ?";
-        my $sth = $self->{dbh}->prepare($sQuery);
-
-        unless ($sth->execute($sChannel)) {
-            $self->{logger}->log(1, "logBotAction() SQL Error: $DBI::errstr Query: $sQuery");
-            return;
-        }
-
-        my $ref = $sth->fetchrow_hashref();
-        unless ($ref) {
-            $self->{logger}->log(3, "logBotAction() channel not found: $sChannel");
-            return;
-        }
-
-        $id_channel = $ref->{'id_channel'};
-    }
-
-    # Perform the actual insert — ts will be auto-filled by MariaDB
-    my $insert_query = <<'SQL';
-INSERT INTO CHANNEL_LOG (id_channel, event_type, nick, userhost, publictext)
-VALUES (?, ?, ?, ?, ?)
-SQL
-
-    my $sth_insert = $self->{dbh}->prepare($insert_query);
-    unless ($sth_insert->execute($id_channel, $eventtype, $sNick, $sUserhost, $sText)) {
-        $self->{logger}->log(1, "logBotAction() SQL Insert Error: $DBI::errstr Query: $insert_query");
-    } else {
-        $self->{logger}->log(5, "logBotAction() inserted $eventtype event into CHANNEL_LOG");
     }
 }
 
